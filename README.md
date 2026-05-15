@@ -18,8 +18,7 @@ Motivated by the need to let coding agents stay running while you carry your Mac
 
 ## Installation & Usage
 
-Install through the `.dmg` in Releases. Release builds are universal macOS
-binaries for both Intel (`x86_64`) and Apple Silicon (`arm64`) Macs.
+Install through the `.dmg` in Releases. Supports both Apple Silicon and Intel Macs (universal binary).
 
 Requires App Background Activity permission (`System Settings -> General -> Login Items & Extensions`). Should pop up automatically on first run.
 

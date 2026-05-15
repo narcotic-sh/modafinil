@@ -2,9 +2,7 @@
 set -eu
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-CONFIGURATION="release"
 SIGN_IDENTITY="${SIGN_IDENTITY:-Developer ID Application: HAMZA QAYYUM (3LF26Z4G2R)}"
-BUILD_DIR="$ROOT_DIR/.build/apple/Products/Release"
 DIST_DIR="$ROOT_DIR/dist"
 APP_PATH="$DIST_DIR/Modafinil.app"
 CONTENTS_DIR="$APP_PATH/Contents"
@@ -21,7 +19,8 @@ if ! security find-identity -v -p codesigning | grep -F "$SIGN_IDENTITY" >/dev/n
   exit 1
 fi
 
-swift build -c "$CONFIGURATION" --arch x86_64 --arch arm64
+BUILD_DIR="$(swift build -c release --arch x86_64 --arch arm64 --show-bin-path)"
+swift build -c release --arch x86_64 --arch arm64
 
 lipo "$BUILD_DIR/Modafinil" -verify_arch x86_64 arm64 >/dev/null
 lipo "$BUILD_DIR/ModafinilHelper" -verify_arch x86_64 arm64 >/dev/null

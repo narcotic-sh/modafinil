@@ -2,9 +2,7 @@
 set -eu
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-CONFIGURATION="release"
-SIGN_IDENTITY="Developer ID Application: HAMZA QAYYUM (3LF26Z4G2R)"
-BUILD_DIR="$ROOT_DIR/.build/$CONFIGURATION"
+SIGN_IDENTITY="${SIGN_IDENTITY:-Developer ID Application: HAMZA QAYYUM (3LF26Z4G2R)}"
 DIST_DIR="$ROOT_DIR/dist"
 APP_PATH="$DIST_DIR/Modafinil.app"
 CONTENTS_DIR="$APP_PATH/Contents"
@@ -16,10 +14,16 @@ cd "$ROOT_DIR"
 
 if ! security find-identity -v -p codesigning | grep -F "$SIGN_IDENTITY" >/dev/null; then
   echo "Missing signing identity: $SIGN_IDENTITY" >&2
+  echo "For local development, pass your own Apple Development identity:" >&2
+  echo "  SIGN_IDENTITY=\"Apple Development: Your Name (TEAMID)\" $0" >&2
   exit 1
 fi
 
-swift build -c "$CONFIGURATION"
+BUILD_DIR="$(swift build -c release --arch x86_64 --arch arm64 --show-bin-path)"
+swift build -c release --arch x86_64 --arch arm64
+
+lipo "$BUILD_DIR/Modafinil" -verify_arch x86_64 arm64 >/dev/null
+lipo "$BUILD_DIR/ModafinilHelper" -verify_arch x86_64 arm64 >/dev/null
 
 rm -rf "$APP_PATH"
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR" "$DAEMONS_DIR"

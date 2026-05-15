@@ -18,10 +18,10 @@ Motivated by the need to let coding agents stay running while you carry your Mac
 
 ## Installation & Usage
 
-Install through the `.dmg` in Releases.
+Install through the `.dmg` in Releases. Supports both Apple Silicon and Intel Macs (universal binary).
 
 Requires App Background Activity permission (`System Settings -> General -> Login Items & Extensions`). Should pop up automatically on first run.
 
 Left click to activate/deactivate. Right click for menu, where you can quit the app and also uninstall it.
 
-Tested thus far only on Apple Silicon with macOS 13+.
+Requires macOS 13+.

@@ -8,20 +8,22 @@
 
 ---
 
-A macOS menu bar app that prevents your MacBook from falling asleep when the lid is closed, while letting the display turn off like normal to preserve battery and reduce heat.
+A macOS menu bar app that prevents your MacBook from falling asleep, both when the lid is open and when the lid is closed.
+
+When the lid is closed, it lets the display turn off like normal to preserve battery and reduce heat.
 
 Motivated by the need to let coding agents stay running while you carry your MacBook around.
 
 <p>
-  <img width="560" height="218" alt="590059860-a03f5bb4-d979-4af5-a895-949414f0efb8" src="https://github.com/user-attachments/assets/e3f5dc98-7fab-4e14-9bcb-6ff621a51d05" />
+  <img width="516" height="254" alt="demo" src="https://github.com/user-attachments/assets/b6e27ae7-46af-4497-ab59-fe7f5642cc41" />
 </p>
 
 ## Installation & Usage
 
-Install through the `.dmg` in Releases. Supports both Apple Silicon and Intel Macs (universal binary).
+Install through the latest `.dmg` in Releases. Supports both Apple Silicon and Intel Macs (universal binary).
 
-Requires App Background Activity permission (`System Settings -> General -> Login Items & Extensions`). Should pop up automatically on first run.
+Requires App Background Activity permission (`System Settings -> General -> Login Items & Extensions`). Should pop up automatically on first activation.
 
-Left click to activate/deactivate. Right click for menu, where you can quit the app and also uninstall it.
+Left click to activate/deactivate. Right click for menu, where you can optionally set a time limit, quit the app, and also uninstall it.
 
 Requires macOS 13+.

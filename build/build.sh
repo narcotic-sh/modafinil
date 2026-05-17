@@ -9,8 +9,23 @@ CONTENTS_DIR="$APP_PATH/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
 DAEMONS_DIR="$CONTENTS_DIR/Library/LaunchDaemons"
+SWIFT_FLAGS=""
 
 cd "$ROOT_DIR"
+
+for arg in "$@"; do
+  case "$arg" in
+    --30s)
+      SWIFT_FLAGS="$SWIFT_FLAGS -Xswiftc -DMODAFINIL_TEST_TIMER_PRESET"
+      echo "Including test timer preset: 30 Seconds"
+      ;;
+    *)
+      echo "Unknown option: $arg" >&2
+      echo "Usage: $0 [--30s]" >&2
+      exit 1
+      ;;
+  esac
+done
 
 if ! security find-identity -v -p codesigning | grep -F "$SIGN_IDENTITY" >/dev/null; then
   echo "Missing signing identity: $SIGN_IDENTITY" >&2
@@ -19,8 +34,8 @@ if ! security find-identity -v -p codesigning | grep -F "$SIGN_IDENTITY" >/dev/n
   exit 1
 fi
 
-BUILD_DIR="$(swift build -c release --arch x86_64 --arch arm64 --show-bin-path)"
-swift build -c release --arch x86_64 --arch arm64
+BUILD_DIR="$(swift build -c release --arch x86_64 --arch arm64 $SWIFT_FLAGS --show-bin-path)"
+swift build -c release --arch x86_64 --arch arm64 $SWIFT_FLAGS
 
 lipo "$BUILD_DIR/Modafinil" -verify_arch x86_64 arm64 >/dev/null
 lipo "$BUILD_DIR/ModafinilHelper" -verify_arch x86_64 arm64 >/dev/null

@@ -97,6 +97,10 @@ final class LidMonitor {
         turnDisplayOff()
     }
 
+    func shouldSleepOnTimerExpiry() -> Bool {
+        isLidClosed() == true && !Self.hasExternalDisplay()
+    }
+
     func isLidClosed() -> Bool? {
         guard rootDomain != IO_OBJECT_NULL else { return nil }
 

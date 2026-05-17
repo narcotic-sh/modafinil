@@ -14,6 +14,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var sleepStatusGeneration = 0
     private var isQuitInProgress = false
     private var isTerminatingAfterCleanup = false
+    private var isSleepRestoreInProgress = false
+    private var selectedTimerLimit = SleepPreventionTimeLimit.savedValue(
+        key: AppDelegate.selectedTimerLimitDefaultsKey
+    )
+    private var deactivationDeadline = AppDelegate.savedDeactivationDeadline()
+    private var deactivationTimer: DispatchSourceTimer?
+    private var deactivationTimerGeneration = 0
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSLog("Modafinil applicationDidFinishLaunching")
@@ -64,6 +71,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         NotificationCenter.default.removeObserver(self)
+        parkDeactivationTimer()
         helperClient.invalidate()
         lidMonitor.stop()
     }
@@ -90,7 +98,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func toggleSleepPrevention() {
-        guard !isToggleInFlight else { return }
+        guard !isSleepOperationInFlight else { return }
 
         lastError = nil
 
@@ -102,15 +110,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        setSleepPreventionEnabled(nextState)
+        setSleepPreventionEnabled(nextState, reason: .userAction)
     }
 
-    private func setSleepPreventionEnabled(_ enabled: Bool) {
+    private func setSleepPreventionEnabled(
+        _ enabled: Bool,
+        reason: SleepPreventionChangeReason
+    ) {
         let previousState = isSleepPreventionEnabled
+        let previousDeactivationDeadline = deactivationDeadline
         isToggleInFlight = true
         sleepStatusGeneration += 1
         isSleepPreventionEnabled = enabled
         lidMonitor.setEnabled(enabled)
+        if !enabled {
+            switch reason {
+            case .timerExpired:
+                parkDeactivationTimer()
+            case .userAction:
+                cancelDeactivationTimer()
+            }
+        }
         refreshIcon()
 
         helperClient.setSleepPreventionEnabled(enabled) { [weak self] result in
@@ -118,12 +138,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
             switch result {
             case .success:
+                self.lastError = nil
                 if enabled {
                     self.lidMonitor.turnDisplayOffIfNeeded()
+                    self.scheduleDeactivationTimerIfNeeded()
+                } else {
+                    self.cancelDeactivationTimer()
+                    if reason == .timerExpired {
+                        self.sleepNowIfNeededAfterTimerExpiry()
+                    }
                 }
             case .failure(let error):
                 self.isSleepPreventionEnabled = previousState
                 self.lidMonitor.setEnabled(previousState)
+                if previousState, let previousDeactivationDeadline {
+                    switch reason {
+                    case .timerExpired:
+                        self.scheduleDeactivationTimer(
+                            until: previousDeactivationDeadline,
+                            minimumDelay: Self.deactivationRetryDelay
+                        )
+                    case .userAction:
+                        self.restoreDeactivationTimer(until: previousDeactivationDeadline)
+                    }
+                } else if previousState {
+                    self.setDeactivationDeadline(nil)
+                } else {
+                    self.cancelDeactivationTimer()
+                }
                 self.lastError = error.localizedDescription
             }
 
@@ -150,7 +192,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refreshHelperStatus()
 
         if let stateAfterInstall, helperStatus == .enabled {
-            setSleepPreventionEnabled(stateAfterInstall)
+            setSleepPreventionEnabled(stateAfterInstall, reason: .userAction)
             return
         }
 
@@ -247,21 +289,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func restoreNormalSleepBehavior(completion: @escaping (Result<Void, Error>) -> Void) {
+        guard !isToggleInFlight, !isSleepRestoreInProgress else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                self?.restoreNormalSleepBehavior(completion: completion)
+            }
+            return
+        }
+
         refreshHelperStatus()
+        let parkedDeactivationDeadline = deactivationDeadline
+        parkDeactivationTimer()
+        isSleepRestoreInProgress = true
+
+        let finish: (Result<Void, Error>) -> Void = { [weak self] result in
+            guard let self else {
+                completion(result)
+                return
+            }
+
+            switch result {
+            case .success:
+                self.cancelDeactivationTimer()
+            case .failure:
+                self.restoreDeactivationTimer(until: parkedDeactivationDeadline)
+            }
+
+            self.isSleepRestoreInProgress = false
+            completion(result)
+        }
+
         let localSleepPreventionStatus = readLocalSleepPreventionStatus()
 
         if localSleepPreventionStatus == false {
             isSleepPreventionEnabled = false
             lidMonitor.setEnabled(false)
-            completion(.success(()))
+            finish(.success(()))
             return
         }
 
         guard helperStatus == .enabled else {
             if localSleepPreventionStatus == true {
-                completion(.failure(SleepRestoreError("Sleep prevention is still enabled, but the privileged helper is not enabled.")))
+                finish(.failure(SleepRestoreError("Sleep prevention is still enabled, but the privileged helper is not enabled.")))
             } else {
-                completion(.failure(SleepRestoreError("Modafinil could not confirm or restore regular sleep behavior because the privileged helper is not enabled.")))
+                finish(.failure(SleepRestoreError("Modafinil could not confirm or restore regular sleep behavior because the privileged helper is not enabled.")))
             }
             return
         }
@@ -277,7 +347,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.lidMonitor.setEnabled(false)
             }
 
-            completion(result)
+            finish(result)
         }
     }
 
@@ -291,6 +361,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 .last == "1"
         } catch {
             return nil
+        }
+    }
+
+    private func sleepNowIfNeededAfterTimerExpiry() {
+        guard lidMonitor.shouldSleepOnTimerExpiry() else { return }
+
+        do {
+            try Shell.run("/usr/bin/pmset", ["sleepnow"])
+        } catch {
+            lastError = error.localizedDescription
         }
     }
 
@@ -348,9 +428,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private static let applicationsDirectoryURL = URL(fileURLWithPath: "/Applications", isDirectory: true).standardizedFileURL
+    private static let selectedTimerLimitDefaultsKey = "SelectedTimerLimitSeconds"
+    private static let activeTimerDeadlineDefaultsKey = "ActiveTimerDeadline"
+    private static let deactivationRetryDelay: TimeInterval = 5
 
     private func setControlsEnabled(_ enabled: Bool) {
         statusItem?.button?.isEnabled = enabled
+    }
+
+    private var isSleepOperationInFlight: Bool {
+        isToggleInFlight || isSleepRestoreInProgress
     }
 
     private func refreshHelperStatus() {
@@ -365,12 +452,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let localSleepPreventionStatus = readLocalSleepPreventionStatus() {
             isSleepPreventionEnabled = localSleepPreventionStatus
             lidMonitor.setEnabled(localSleepPreventionStatus)
+            if !localSleepPreventionStatus {
+                cancelDeactivationTimer()
+            }
             if localSleepPreventionStatus {
                 lidMonitor.turnDisplayOffIfNeeded()
+                resumeDeactivationTimerIfNeeded()
             }
         } else if helperStatus != .enabled {
             isSleepPreventionEnabled = false
             lidMonitor.setEnabled(false)
+            cancelDeactivationTimer()
         }
 
         guard helperStatus == .enabled else {
@@ -386,8 +478,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             case .success(let enabled):
                 self.isSleepPreventionEnabled = enabled
                 self.lidMonitor.setEnabled(enabled)
+                if !enabled {
+                    self.cancelDeactivationTimer()
+                }
                 if enabled {
                     self.lidMonitor.turnDisplayOffIfNeeded()
+                    self.resumeDeactivationTimerIfNeeded()
                 }
             case .failure(let error):
                 self.lastError = error.localizedDescription
@@ -416,10 +512,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             : "Mac is not on Modafinil"
     }
 
+    @objc private func selectTimerLimit(_ sender: NSMenuItem) {
+        guard !isSleepOperationInFlight else { return }
+        guard let timerLimit = SleepPreventionTimeLimit(rawValue: sender.tag) else { return }
+
+        selectedTimerLimit = timerLimit
+        UserDefaults.standard.set(timerLimit.rawValue, forKey: Self.selectedTimerLimitDefaultsKey)
+
+        if isSleepPreventionEnabled, !isToggleInFlight {
+            scheduleDeactivationTimerIfNeeded()
+        } else if timerLimit == .none || !isSleepPreventionEnabled {
+            cancelDeactivationTimer()
+        }
+
+        refreshIcon()
+    }
+
     private func showMenu() {
         refreshHelperStatus()
 
         let menu = NSMenu()
+        menu.autoenablesItems = false
 
         let statusText = isSleepPreventionEnabled ? "Status: On Modafinil" : "Status: Not on Modafinil"
         let stateItem = NSMenuItem(title: statusText, action: nil, keyEquivalent: "")
@@ -440,7 +553,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             keyEquivalent: ""
         )
         toggleItem.target = self
+        toggleItem.isEnabled = !isSleepOperationInFlight
         menu.addItem(toggleItem)
+
+        let timerItem = NSMenuItem(title: timerMenuTitle, action: nil, keyEquivalent: "")
+        timerItem.submenu = makeTimerLimitMenu()
+        timerItem.isEnabled = !isSleepOperationInFlight
+        menu.addItem(timerItem)
 
         let settingsItem = NSMenuItem(
             title: "Open App Background Activity Settings",
@@ -469,6 +588,179 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.menu = nil
     }
 
+    private var timerMenuTitle: String {
+        if let remaining = activeTimerRemainingDescription {
+            return "Time Limit: \(selectedTimerLimit.shortTitle) (\(remaining) left)"
+        }
+
+        return "Time Limit: \(selectedTimerLimit.title)"
+    }
+
+    private func makeTimerLimitMenu() -> NSMenu {
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+
+        for timerLimit in SleepPreventionTimeLimit.allCases {
+            let item = NSMenuItem(
+                title: timerLimit.title,
+                action: #selector(selectTimerLimit(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.tag = timerLimit.rawValue
+            item.state = selectedTimerLimit == timerLimit ? .on : .off
+            item.isEnabled = !isSleepOperationInFlight
+            menu.addItem(item)
+
+            if timerLimit == .none {
+                menu.addItem(.separator())
+            }
+        }
+
+        return menu
+    }
+
+    private var activeTimerRemainingDescription: String? {
+        guard isSleepPreventionEnabled, let deactivationDeadline else { return nil }
+        let secondsRemaining = max(0, Int(ceil(deactivationDeadline.timeIntervalSinceNow)))
+        return Self.formatDuration(seconds: secondsRemaining)
+    }
+
+    private func scheduleDeactivationTimerIfNeeded() {
+        guard isSleepPreventionEnabled, let duration = selectedTimerLimit.duration else {
+            cancelDeactivationTimer()
+            return
+        }
+
+        scheduleDeactivationTimer(until: Date().addingTimeInterval(duration))
+    }
+
+    private func resumeDeactivationTimerIfNeeded() {
+        guard isSleepPreventionEnabled else {
+            cancelDeactivationTimer()
+            return
+        }
+
+        guard let deactivationDeadline else { return }
+        scheduleDeactivationTimer(until: deactivationDeadline)
+    }
+
+    private func restoreDeactivationTimer(until deadline: Date?) {
+        guard let deadline, isSleepPreventionEnabled else {
+            cancelDeactivationTimer()
+            return
+        }
+
+        scheduleDeactivationTimer(until: deadline)
+    }
+
+    private func scheduleDeactivationTimer(
+        until deadline: Date,
+        minimumDelay: TimeInterval = 0
+    ) {
+        parkDeactivationTimer()
+        setDeactivationDeadline(deadline)
+        deactivationTimerGeneration += 1
+
+        let generation = deactivationTimerGeneration
+        let delay = max(deadline.timeIntervalSinceNow, minimumDelay)
+        guard delay > 0 else {
+            expireDeactivationTimer(generation: generation)
+            return
+        }
+
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        let milliseconds = Int((delay * 1_000).rounded(.up))
+        timer.schedule(deadline: .now() + .milliseconds(milliseconds), leeway: .seconds(1))
+        timer.setEventHandler { [weak self] in
+            self?.deactivationTimerFired(generation: generation)
+        }
+        deactivationTimer = timer
+        timer.resume()
+        refreshIcon()
+    }
+
+    private func cancelDeactivationTimer() {
+        parkDeactivationTimer()
+        setDeactivationDeadline(nil)
+    }
+
+    private func parkDeactivationTimer() {
+        deactivationTimerGeneration += 1
+        deactivationTimer?.cancel()
+        deactivationTimer = nil
+    }
+
+    private func deactivationTimerFired(generation: Int) {
+        guard generation == deactivationTimerGeneration else { return }
+
+        deactivationTimer?.cancel()
+        deactivationTimer = nil
+        expireDeactivationTimer(generation: generation)
+    }
+
+    private func expireDeactivationTimer(generation: Int) {
+        guard generation == deactivationTimerGeneration else { return }
+        guard isSleepPreventionEnabled else {
+            cancelDeactivationTimer()
+            refreshIcon()
+            return
+        }
+
+        guard !isSleepOperationInFlight else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                self?.expireDeactivationTimer(generation: generation)
+            }
+            return
+        }
+
+        setSleepPreventionEnabled(false, reason: .timerExpired)
+    }
+
+    private func setDeactivationDeadline(_ deadline: Date?) {
+        deactivationDeadline = deadline
+
+        if let deadline {
+            UserDefaults.standard.set(
+                deadline.timeIntervalSince1970,
+                forKey: Self.activeTimerDeadlineDefaultsKey
+            )
+        } else {
+            UserDefaults.standard.removeObject(forKey: Self.activeTimerDeadlineDefaultsKey)
+        }
+    }
+
+    private static func savedDeactivationDeadline(defaults: UserDefaults = .standard) -> Date? {
+        guard defaults.object(forKey: activeTimerDeadlineDefaultsKey) != nil else {
+            return nil
+        }
+
+        let timestamp = defaults.double(forKey: activeTimerDeadlineDefaultsKey)
+        guard timestamp > 0 else { return nil }
+
+        return Date(timeIntervalSince1970: timestamp)
+    }
+
+    private static func formatDuration(seconds: Int) -> String {
+        guard seconds > 0 else { return "<1 min" }
+
+        let minutes = max(1, Int(ceil(Double(seconds) / 60.0)))
+        guard minutes >= 60 else {
+            return "\(minutes) \(minutes == 1 ? "min" : "mins")"
+        }
+
+        let hours = minutes / 60
+        let remainingMinutes = minutes % 60
+
+        if remainingMinutes == 0 {
+            return "\(hours) \(hours == 1 ? "hr" : "hrs")"
+        }
+
+        let hourText = "\(hours) \(hours == 1 ? "hr" : "hrs")"
+        let minuteText = "\(remainingMinutes) \(remainingMinutes == 1 ? "min" : "mins")"
+        return "\(hourText) \(minuteText)"
+    }
+
     private func showError(title: String, message: String) {
         let alert = NSAlert()
         alert.messageText = title
@@ -486,6 +778,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         var errorDescription: String? { message }
+    }
+
+    private enum SleepPreventionChangeReason {
+        case userAction
+        case timerExpired
     }
 
     private static let inactiveSymbolName: String = {

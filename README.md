@@ -1,12 +1,4 @@
-<p align="center">
-  <img height="182" src="/assets/app-icon.png">
-</p>
-
-<p align="center">
-  <img src="/assets/title.svg" alt="Let your agents run with your MacBook lid closed">
-</p>
-
----
+# Modafinil
 
 A macOS menu bar app that prevents your MacBook from falling asleep, both when the lid is open and when the lid is closed.
 

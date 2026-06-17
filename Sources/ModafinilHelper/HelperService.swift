@@ -14,6 +14,8 @@ final class HelperService: NSObject, NSXPCListenerDelegate {
 
     override init() {
         super.init()
+        // Bind authorization to the XPC peer instead of re-checking a reusable PID.
+        listener.setConnectionCodeSigningRequirement(ModafinilConstants.appSigningRequirement)
         listener.delegate = self
         performStartupCleanup()
     }
@@ -27,10 +29,6 @@ final class HelperService: NSObject, NSXPCListenerDelegate {
         _ listener: NSXPCListener,
         shouldAcceptNewConnection newConnection: NSXPCConnection
     ) -> Bool {
-        guard ClientValidator.allows(processIdentifier: newConnection.processIdentifier) else {
-            return false
-        }
-
         let session = HelperSession(service: self)
         clientConnectionStarted(sessionID: session.id)
 

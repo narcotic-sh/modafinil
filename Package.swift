@@ -26,10 +26,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "ModafinilHelper",
-            dependencies: ["ModafinilShared"],
-            linkerSettings: [
-                .linkedFramework("Security")
-            ]
+            dependencies: ["ModafinilShared"]
         )
     ]
 )

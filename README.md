@@ -16,6 +16,8 @@ Install through the latest `.dmg` in Releases. Supports both Apple Silicon and I
 
 Requires App Background Activity permission (`System Settings -> General -> Login Items & Extensions`). Should pop up automatically on first activation.
 
-Left click to activate/deactivate. Right click for menu, where you can optionally set a time limit, quit the app, and also uninstall it.
+Left click to activate/deactivate. Right click for menu, where you can optionally set a time limit or a battery safety threshold, quit the app, and also uninstall it.
+
+The battery safety threshold restores normal sleep behavior when the Mac is running on battery and reaches the selected charge level. If the lid is closed, the Mac goes to sleep immediately. The setting is off by default.
 
 Requires macOS 13+.

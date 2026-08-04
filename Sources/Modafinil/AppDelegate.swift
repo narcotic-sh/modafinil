@@ -5,6 +5,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let helperClient = PrivilegedHelperClient()
     private let helperInstaller = PrivilegedHelperInstaller()
     private let lidMonitor = LidMonitor()
+    private let batteryMonitor = BatteryMonitor()
 
     private var statusItem: NSStatusItem!
     private var isSleepPreventionEnabled = false
@@ -21,6 +22,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var deactivationDeadline = AppDelegate.savedDeactivationDeadline()
     private var deactivationTimer: DispatchSourceTimer?
     private var deactivationTimerGeneration = 0
+    private var selectedBatteryThreshold = BatterySleepThreshold.savedValue(
+        key: AppDelegate.selectedBatteryThresholdDefaultsKey
+    )
+    private var batteryStatus: BatteryStatus?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSLog("Modafinil applicationDidFinishLaunching")
@@ -51,6 +56,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             lastError = error.localizedDescription
         }
 
+        batteryMonitor.onStatusChange = { [weak self] status in
+            guard let self else { return }
+            self.batteryStatus = status
+            self.evaluateBatteryThreshold()
+        }
+        do {
+            try batteryMonitor.start()
+        } catch {
+            lastError = error.localizedDescription
+        }
+
         refreshHelperStatus()
         refreshSleepStatus()
         refreshIcon()
@@ -74,6 +90,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         parkDeactivationTimer()
         helperClient.invalidate()
         lidMonitor.stop()
+        batteryMonitor.stop()
     }
 
     @objc private func screenParametersDidChange() {
@@ -125,7 +142,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         lidMonitor.setEnabled(enabled)
         if !enabled {
             switch reason {
-            case .timerExpired:
+            case .timerExpired, .batteryThresholdReached:
                 parkDeactivationTimer()
             case .userAction:
                 cancelDeactivationTimer()
@@ -144,8 +161,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.scheduleDeactivationTimerIfNeeded()
                 } else {
                     self.cancelDeactivationTimer()
-                    if reason == .timerExpired {
-                        self.sleepNowIfNeededAfterTimerExpiry()
+                    if reason.isAutomatic {
+                        self.sleepNowIfNeededAfterAutomaticDeactivation()
                     }
                 }
             case .failure(let error):
@@ -153,7 +170,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.lidMonitor.setEnabled(previousState)
                 if previousState, let previousDeactivationDeadline {
                     switch reason {
-                    case .timerExpired:
+                    case .timerExpired, .batteryThresholdReached:
                         self.scheduleDeactivationTimer(
                             until: previousDeactivationDeadline,
                             minimumDelay: Self.deactivationRetryDelay
@@ -171,6 +188,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
             self.isToggleInFlight = false
             self.refreshIcon()
+            if enabled {
+                self.evaluateBatteryThreshold()
+            }
         }
     }
 
@@ -364,7 +384,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func sleepNowIfNeededAfterTimerExpiry() {
+    private func sleepNowIfNeededAfterAutomaticDeactivation() {
         guard lidMonitor.shouldSleepOnTimerExpiry() else { return }
 
         do {
@@ -429,6 +449,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private static let applicationsDirectoryURL = URL(fileURLWithPath: "/Applications", isDirectory: true).standardizedFileURL
     private static let selectedTimerLimitDefaultsKey = "SelectedTimerLimitSeconds"
+    private static let selectedBatteryThresholdDefaultsKey = "SelectedBatterySleepThresholdPercent"
     private static let activeTimerDeadlineDefaultsKey = "ActiveTimerDeadline"
     private static let deactivationRetryDelay: TimeInterval = 5
 
@@ -561,6 +582,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         timerItem.isEnabled = !isSleepOperationInFlight
         menu.addItem(timerItem)
 
+        let batteryItem = NSMenuItem(title: batteryMenuTitle, action: nil, keyEquivalent: "")
+        batteryItem.submenu = makeBatteryThresholdMenu()
+        batteryItem.isEnabled = !isSleepOperationInFlight
+        menu.addItem(batteryItem)
+
         let settingsItem = NSMenuItem(
             title: "Open App Background Activity Settings",
             action: #selector(openSettings),
@@ -596,6 +622,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return "Time Limit: \(selectedTimerLimit.title)"
     }
 
+    private var batteryMenuTitle: String {
+        let setting = selectedBatteryThreshold == .never
+            ? "Off"
+            : "Allow Sleep at \(selectedBatteryThreshold.title)"
+
+        guard let batteryStatus else {
+            return "Battery Safety: \(setting)"
+        }
+
+        let source = batteryStatus.isOnBatteryPower ? "Battery" : "Power Adapter"
+        return "Battery Safety: \(setting) (\(batteryStatus.percentage)%, \(source))"
+    }
+
     private func makeTimerLimitMenu() -> NSMenu {
         let menu = NSMenu()
         menu.autoenablesItems = false
@@ -618,6 +657,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         return menu
+    }
+
+    @objc private func selectBatteryThreshold(_ sender: NSMenuItem) {
+        guard !isSleepOperationInFlight else { return }
+        guard let threshold = BatterySleepThreshold(rawValue: sender.tag) else { return }
+
+        selectedBatteryThreshold = threshold
+        UserDefaults.standard.set(
+            threshold.rawValue,
+            forKey: Self.selectedBatteryThresholdDefaultsKey
+        )
+        evaluateBatteryThreshold()
+    }
+
+    private func makeBatteryThresholdMenu() -> NSMenu {
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+
+        for threshold in BatterySleepThreshold.allCases {
+            let title = threshold == .never ? "Off" : threshold.title
+            let item = NSMenuItem(
+                title: title,
+                action: #selector(selectBatteryThreshold(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.tag = threshold.rawValue
+            item.state = selectedBatteryThreshold == threshold ? .on : .off
+            item.isEnabled = !isSleepOperationInFlight
+            menu.addItem(item)
+
+            if threshold == .never {
+                menu.addItem(.separator())
+            }
+        }
+
+        return menu
+    }
+
+    private func evaluateBatteryThreshold() {
+        guard isSleepPreventionEnabled,
+              let threshold = selectedBatteryThreshold.percentage,
+              let batteryStatus,
+              batteryStatus.isOnBatteryPower,
+              batteryStatus.percentage <= threshold
+        else {
+            return
+        }
+
+        guard !isSleepOperationInFlight else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                self?.evaluateBatteryThreshold()
+            }
+            return
+        }
+
+        setSleepPreventionEnabled(false, reason: .batteryThresholdReached)
     }
 
     private var activeTimerRemainingDescription: String? {
@@ -783,6 +879,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private enum SleepPreventionChangeReason {
         case userAction
         case timerExpired
+        case batteryThresholdReached
+
+        var isAutomatic: Bool {
+            switch self {
+            case .userAction:
+                return false
+            case .timerExpired, .batteryThresholdReached:
+                return true
+            }
+        }
     }
 
     private static let inactiveSymbolName: String = {

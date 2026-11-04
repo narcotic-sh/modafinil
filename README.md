@@ -95,6 +95,11 @@ keep-awake back on, so the next closed-lid agent session keeps running.
   people and can last for days.
 - The minute of grace covers a subagent finishing before its parent resumes and a queued
   message starting the next turn.
+- Since Mac 0.9.2 a **Wake & Keep Awake** from the iPhone, or a wake alarm, with the lid
+  closed and this rule on, keeps the Mac awake even though T3 has already finished: the rule waits until a T3 thread starts
+  working again and sleeps a minute after that run ends. Before, a closed-lid Mac woken
+  from the iPhone fell back to sleep about a minute later. The next sleep request,
+  opening the lid or changing the setting ends the wait. The iPhone card shows "sleeps after the next T3 run".
 - If T3 Code is not running, nothing counts as working. If its state cannot be read
   (for example after a T3 update changes its database), Modafinil does not sleep and
   shows the reason.

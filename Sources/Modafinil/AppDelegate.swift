@@ -1096,6 +1096,16 @@ final class AppDelegate: NSObject,
 
             switch result {
             case .success:
+                // Without this, a closed-lid Mac with T3 already finished would be
+                // put back to sleep by "Sleep when T3 finishes" a minute after the
+                // iPhone woke it.
+                // Only a closed-lid wake with the feature on needs the wait; a wait
+                // left over from an open-lid wake would block the rule later.
+                if self.isT3SleepEnabled, self.lidMonitor.isLidClosed() != false {
+                    self.t3SleepWatch.waitForNewActivity()
+                    self.t3SleepAt = nil
+                    self.historyRecorder.note("Sleep when T3 finishes: waiting for a T3 thread to start (\(source))")
+                }
                 completion(.success((
                     self.makeRemoteState(),
                     "Modafinil is keeping the Mac awake."
@@ -1160,6 +1170,8 @@ final class AppDelegate: NSObject,
         let previousRequestedState = isSleepPreventionRequested
         let previousProvisionalLease = isProvisionalWakeLeaseActive
 
+        // The wait for new T3 activity belongs to the wake that just ended.
+        t3SleepWatch.clearWaitForNewActivity()
         // The helper retries for about 30 s, which gives the apps time to quit.
         quitSleepBlockingApps(before: source)
         lastError = nil
@@ -1231,7 +1243,11 @@ final class AppDelegate: NSObject,
             waiting = threads.filter(\.isWaiting).count
             working = threads.count - waiting
         }
-        return RemoteT3Sleep(enabled: true, summary: String(activity.summary.prefix(120)),
+        var summary = activity.summary
+        if t3SleepWatch.waitsForNewActivity, activity.isFinished {
+            summary += " · sleeps after the next T3 run"
+        }
+        return RemoteT3Sleep(enabled: true, summary: String(summary.prefix(120)),
                              working: working, waiting: waiting,
                              sleepAt: t3SleepAt.map { Int64($0.timeIntervalSince1970) },
                              restorePending: isKeepAwakeSuspendedForT3Sleep)
@@ -1478,6 +1494,8 @@ final class AppDelegate: NSObject,
     private func setT3SleepEnabled(_ enabled: Bool, source: String) {
         guard enabled != isT3SleepEnabled else { return }
         isT3SleepEnabled = enabled
+        // Changing the setting starts the rule fresh.
+        t3SleepWatch.clearWaitForNewActivity()
         UserDefaults.standard.set(enabled, forKey: Self.t3SleepEnabledDefaultsKey)
         if !enabled { isKeepAwakeSuspendedForT3Sleep = false }
         historyRecorder.note("Sleep when T3 Code finishes \(enabled ? "on" : "off") (\(source))")
@@ -1517,6 +1535,8 @@ final class AppDelegate: NSObject,
     }
 
     private func handleLidStateChange() {
+        // Someone is at the Mac: closing the lid again restores the normal rule.
+        if lidMonitor.isLidClosed() == false { t3SleepWatch.clearWaitForNewActivity() }
         evaluateT3Sleep()
         restoreKeepAwakeAfterT3SleepIfLidOpen()
     }
@@ -1531,7 +1551,7 @@ final class AppDelegate: NSObject,
         )
         let previousSleepAt = t3SleepAt
         switch t3SleepWatch.evaluate(conditions, now: Date(), activity: readT3Activity) {
-        case .notWatching:
+        case .notWatching, .waitingForActivity:
             t3SleepAt = nil
             endT3WatchActivity()
         case .busy:

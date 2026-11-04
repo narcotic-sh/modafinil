@@ -215,6 +215,35 @@ final class T3SleepWatchTests: XCTestCase {
         XCTAssertEqual(watch.evaluate(closed, now: start.addingTimeInterval(60)) { .idle }, .sleepNow)
     }
 
+    /// 2026-11-02: an iPhone Wake & Keep Awake at 12:25 was undone at 12:26 because
+    /// T3 was already finished with the lid closed.
+    func testRemoteWakeWaitsForNewT3ActivityBeforeSleepingAgain() {
+        var watch = T3SleepWatch(gracePeriod: 60)
+        watch.waitForNewActivity()
+        XCTAssertEqual(watch.evaluate(closed, now: start) { .idle }, .waitingForActivity)
+        XCTAssertEqual(watch.evaluate(closed, now: start.addingTimeInterval(600)) { .notRunning },
+                       .waitingForActivity)
+        // A later maintenance wake resets the grace period but keeps the wait.
+        watch.reset()
+        XCTAssertEqual(watch.evaluate(closed, now: start.addingTimeInterval(700)) { .idle },
+                       .waitingForActivity)
+        XCTAssertEqual(watch.evaluate(closed, now: start.addingTimeInterval(710)) {
+            .busy([T3ActiveThread(title: "New run", status: "running")])
+        }, .busy)
+        XCTAssertFalse(watch.waitsForNewActivity)
+        XCTAssertEqual(watch.evaluate(closed, now: start.addingTimeInterval(720)) { .idle },
+                       .waitingForGrace(sleepAt: start.addingTimeInterval(780)))
+        XCTAssertEqual(watch.evaluate(closed, now: start.addingTimeInterval(780)) { .idle }, .sleepNow)
+    }
+
+    func testClearingTheWaitRestoresTheNormalRule() {
+        var watch = T3SleepWatch(gracePeriod: 0)
+        watch.waitForNewActivity()
+        XCTAssertEqual(watch.evaluate(closed, now: start) { .idle }, .waitingForActivity)
+        watch.clearWaitForNewActivity()
+        XCTAssertEqual(watch.evaluate(closed, now: start) { .idle }, .sleepNow)
+    }
+
     func testNewWorkRestartsTheGracePeriod() {
         var watch = T3SleepWatch(gracePeriod: 60)
         _ = watch.evaluate(closed, now: start) { .idle }

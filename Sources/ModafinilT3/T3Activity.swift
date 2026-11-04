@@ -233,6 +233,9 @@ public struct T3SleepWatch {
 
     public enum Decision: Equatable {
         case notWatching
+        /// Keep-awake was just turned on from the iPhone or a wake alarm while T3 was
+        /// idle. Sleep only after a T3 thread has worked again.
+        case waitingForActivity
         case busy
         case waitingForGrace(sleepAt: Date)
         case sleepNow
@@ -245,6 +248,10 @@ public struct T3SleepWatch {
 
     public let gracePeriod: TimeInterval
     public private(set) var finishedSince: Date?
+    /// Set by an explicit remote Wake & Keep Awake (or a wake alarm): the person
+    /// wants the Mac awake now, so an already-finished T3 must not put it straight
+    /// back to sleep. Cleared once T3 is seen working.
+    public private(set) var waitsForNewActivity = false
 
     public init(gracePeriod: TimeInterval = T3SleepWatch.defaultGracePeriod) {
         self.gracePeriod = gracePeriod
@@ -264,7 +271,12 @@ public struct T3SleepWatch {
         }
         guard activity().isFinished else {
             finishedSince = nil
+            waitsForNewActivity = false
             return .busy
+        }
+        if waitsForNewActivity {
+            finishedSince = nil
+            return .waitingForActivity
         }
         let since = finishedSince ?? now
         finishedSince = since
@@ -272,7 +284,18 @@ public struct T3SleepWatch {
         return now >= sleepAt ? .sleepNow : .waitingForGrace(sleepAt: sleepAt)
     }
 
+    /// A wake resets the grace period but keeps `waitsForNewActivity`.
     public mutating func reset() {
         finishedSince = nil
+    }
+
+    public mutating func waitForNewActivity() {
+        finishedSince = nil
+        waitsForNewActivity = true
+    }
+
+    /// Turning the feature off or keep-awake off from the Mac ends the wait.
+    public mutating func clearWaitForNewActivity() {
+        waitsForNewActivity = false
     }
 }

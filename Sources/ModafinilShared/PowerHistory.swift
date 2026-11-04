@@ -120,7 +120,9 @@ public enum PowerReason {
         if text.contains("hid") || text.contains("keyboard") || text.contains("trackpad")
             || text.contains("pwrbtn") || text.contains("power button") || text.contains("useractivity") { return .userInput }
         if text.contains("e_rx_ip_packet") || text.contains("wifibt") || text.contains("wlan")
-            || text.contains("arpt") || text.contains("en0") || text.contains("network") { return .network }
+            || text.contains("arpt") || text.contains("en0") || text.contains("network")
+            // Wired Ethernet wakes (Mac mini): "enet SMC.OutboxNotEmpty lan0/".
+            || text.contains("enet") || text.contains("lan0") { return .network }
         if text.contains("rtc") || text.contains("alarm") { return .alarm }
         if text.contains("acattach") || text.contains("ac attach") || text.contains("charger")
             || text.contains("battery") || text.contains("usb-c") || text.contains("adapter") { return .power }

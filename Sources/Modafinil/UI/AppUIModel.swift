@@ -3,7 +3,7 @@ import ModafinilShared
 import SwiftUI
 
 enum AppSection: String, CaseIterable, Identifiable, Hashable {
-    case overview, timers, history, iPhone, settings
+    case overview, timers, history, iPhone, otherMacs, settings
 
     var id: String { rawValue }
 
@@ -13,6 +13,7 @@ enum AppSection: String, CaseIterable, Identifiable, Hashable {
         case .timers: return "Timers"
         case .history: return "Sleep History"
         case .iPhone: return "iPhone"
+        case .otherMacs: return "Other Macs"
         case .settings: return "Settings"
         }
     }
@@ -23,6 +24,7 @@ enum AppSection: String, CaseIterable, Identifiable, Hashable {
         case .timers: return "timer"
         case .history: return "chart.bar.xaxis"
         case .iPhone: return "iphone"
+        case .otherMacs: return "desktopcomputer"
         case .settings: return "gearshape"
         }
     }
@@ -41,6 +43,8 @@ struct AppSnapshot {
     var isCodexLimitEnabled = false
     var isCodexRunning = false
     var isT3SleepEnabled = false
+    /// False on a Mac mini or other desktop: the closed-lid T3 rule is hidden.
+    var hasBuiltInLid = true
     /// One line about T3 Code, e.g. "T3 threads: 2 working". Nil when the feature is off.
     var t3Status: String?
     var t3Threads: [T3ThreadRow] = []

@@ -1,4 +1,5 @@
 import AppKit
+import IOKit.pwr_mgt
 import notify
 import ModafinilShared
 import ModafinilRemoteProtocol
@@ -23,6 +24,7 @@ final class AppDelegate: NSObject,
     private let historyRecorder = PowerHistoryRecorder()
     private let loginItems = LoginItemController()
     private let uiModel = AppUIModel()
+    private let remoteMacs = RemoteMacsController()
     private var mainWindowController: MainWindowController?
     private var journalNotifyToken: Int32?
     private var assertionNotifyToken: Int32?
@@ -637,6 +639,7 @@ final class AppDelegate: NSObject,
 
     private func clearPreferences() {
         companionConfigurationStore.deleteSecrets()
+        RemoteMacStore().deleteAll()
         guard let bundleIdentifier = Bundle.main.bundleIdentifier else { return }
         UserDefaults.standard.removePersistentDomain(forName: bundleIdentifier)
         UserDefaults.standard.synchronize()
@@ -709,7 +712,7 @@ final class AppDelegate: NSObject,
         uiModel.actions = self
 
         let controller = mainWindowController ?? {
-            let controller = MainWindowController(model: uiModel)
+            let controller = MainWindowController(model: uiModel, remoteMacs: remoteMacs)
             controller.onClose = { [weak self] in
                 self?.mainWindowController = nil
                 self?.updateActivationPolicy()
@@ -740,8 +743,9 @@ final class AppDelegate: NSObject,
 
         uiModel.actions = self
         uiModel.snapshot = makeSnapshot()
+        remoteMacs.refreshAll()
         if statusPopover.contentViewController == nil {
-            let host = NSHostingController(rootView: MenuBarPopoverView().environmentObject(uiModel))
+            let host = NSHostingController(rootView: MenuBarPopoverView().environmentObject(uiModel).environmentObject(remoteMacs))
             host.sizingOptions = .preferredContentSize
             statusPopover.contentViewController = host
         }
@@ -1106,6 +1110,9 @@ final class AppDelegate: NSObject,
                     self.t3SleepAt = nil
                     self.historyRecorder.note("Sleep when T3 finishes: waiting for a T3 thread to start (\(source))")
                 }
+                // A desktop is a workstation: a remote wake should light its display,
+                // not leave it in a display-off background wake.
+                if !LidMonitor.hasBuiltInLid { Self.declareRemoteUserActivity() }
                 completion(.success((
                     self.makeRemoteState(),
                     "Modafinil is keeping the Mac awake."
@@ -1230,8 +1237,19 @@ final class AppDelegate: NSObject,
                                    detail: $0.details.first.map { String($0.prefix(60)) })
             },
             history: history,
-            t3Sleep: history != nil ? nil : makeRemoteT3Sleep()
+            // Desktops have no lid, so the closed-lid T3 rule never applies; nil tells
+            // Companion 1.9+ to hide the card.
+            t3Sleep: history != nil || !LidMonitor.hasBuiltInLid ? nil : makeRemoteT3Sleep()
         )
+    }
+
+    private static func declareRemoteUserActivity() {
+        var assertionID = IOPMAssertionID(0)
+        let result = IOPMAssertionDeclareUserActivity("Modafinil remote wake" as CFString,
+                                                      kIOPMUserActiveLocal, &assertionID)
+        if result != kIOReturnSuccess {
+            NSLog("Modafinil could not wake the display: 0x%x", result)
+        }
     }
 
     private func makeRemoteT3Sleep() -> RemoteT3Sleep {
@@ -1790,7 +1808,7 @@ final class AppDelegate: NSObject,
         )
         t3SleepItem.target = self
         t3SleepItem.state = isT3SleepEnabled ? .on : .off
-        menu.addItem(t3SleepItem)
+        if LidMonitor.hasBuiltInLid { menu.addItem(t3SleepItem) }
 
         let quitBlockersItem = NSMenuItem(
             title: "Quit Apps Keeping the Mac Awake Before Sleep",
@@ -1878,6 +1896,7 @@ final class AppDelegate: NSObject,
         snapshot.isCodexLimitEnabled = isCodexRuntimeLimitEnabled
         snapshot.isCodexRunning = isCodexRunning
         snapshot.isT3SleepEnabled = isT3SleepEnabled
+        snapshot.hasBuiltInLid = LidMonitor.hasBuiltInLid
         if let activity = currentT3ActivityForDisplay() {
             snapshot.t3Status = activity.summary
             if case .busy(let threads) = activity {

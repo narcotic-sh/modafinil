@@ -48,7 +48,13 @@ final class CompanionConfigurationStore {
 
     /// Authenticates iPhone wake requests to the XR relay. Kept separate so
     /// a compromise of the jailbroken relay phone cannot control this Mac.
-    var relaySecret: Data { cachedRelaySecret }
+    /// Re-read so a secret imported from the command line shows up in a running app.
+    var relaySecret: Data {
+        if let stored = keychain.secret(account: KeychainAccount.relaySecret), stored.count == 32 {
+            cachedRelaySecret = stored
+        }
+        return cachedRelaySecret
+    }
 
     var relayHost: String {
         defaults.string(forKey: Key.relayHost) ?? ""
@@ -103,6 +109,19 @@ final class CompanionConfigurationStore {
             name: .modafinilCompanionConfigurationDidChange,
             object: self
         )
+    }
+
+    /// Uses the relay secret another Mac already shares with the iPad relay, so
+    /// one relay can wake several Macs. The Mac command secret stays unique.
+    @discardableResult
+    func importRelaySecret(base64 text: String) -> Bool {
+        guard let data = Data(base64Encoded: text.trimmingCharacters(in: .whitespacesAndNewlines)),
+              data.count == 32, keychain.setSecret(data, account: KeychainAccount.relaySecret) else {
+            return false
+        }
+        cachedRelaySecret = data
+        NotificationCenter.default.post(name: .modafinilCompanionConfigurationDidChange, object: self)
+        return true
     }
 
     func deleteSecrets() {

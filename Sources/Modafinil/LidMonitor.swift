@@ -99,6 +99,15 @@ final class LidMonitor {
         turnDisplayOff()
     }
 
+    /// False on desktop Macs (Mac mini, Mac Studio, iMac), which have no clamshell.
+    static let hasBuiltInLid: Bool = {
+        let rootDomain = findRootDomain()
+        guard rootDomain != IO_OBJECT_NULL else { return true }
+        defer { IOObjectRelease(rootDomain) }
+        return IORegistryEntryCreateCFProperty(rootDomain, "AppleClamshellState" as CFString,
+                                               kCFAllocatorDefault, 0)?.takeRetainedValue() != nil
+    }()
+
     func isLidClosed() -> Bool? {
         guard rootDomain != IO_OBJECT_NULL else { return nil }
 

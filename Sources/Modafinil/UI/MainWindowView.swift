@@ -22,6 +22,7 @@ struct MainWindowView: View {
                 case .timers: TimersPage()
                 case .history: HistoryPage()
                 case .iPhone: IPhonePage()
+                case .otherMacs: OtherMacsPage()
                 case .settings: SettingsPage()
                 }
             }
@@ -102,7 +103,9 @@ struct OverviewPage: View {
                 }
             }
 
-            T3SleepCard(snapshot: snapshot) { model.actions?.uiToggleT3Sleep() }
+            if snapshot.hasBuiltInLid {
+                T3SleepCard(snapshot: snapshot) { model.actions?.uiToggleT3Sleep() }
+            }
 
             BlockersCard(blockers: snapshot.blockers, quitsBeforeSleep: snapshot.isQuitBlockersEnabled)
         }

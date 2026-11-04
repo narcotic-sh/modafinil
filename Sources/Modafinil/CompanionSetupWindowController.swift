@@ -12,7 +12,7 @@ final class CompanionSetupWindowController: NSWindowController, NSWindowDelegate
     weak var setupDelegate: CompanionSetupWindowControllerDelegate?
 
     init(configurationStore: CompanionConfigurationStore) {
-        let windowSize = NSSize(width: 700, height: 400)
+        let windowSize = NSSize(width: 820, height: 420)
         let viewController = CompanionSetupViewController(
             configurationStore: configurationStore
         )
@@ -79,7 +79,7 @@ private final class CompanionSetupViewController: NSViewController {
 
     override func loadView() {
         let view = NSView(
-            frame: NSRect(origin: .zero, size: NSSize(width: 700, height: 400))
+            frame: NSRect(origin: .zero, size: NSSize(width: 820, height: 420))
         )
         self.view = view
 
@@ -104,14 +104,14 @@ private final class CompanionSetupViewController: NSViewController {
 
         let explanation = NSTextField(
             wrappingLabelWithString: """
-            Configure the XR wake relay, copy the relay secret into the XR's \
-            /var/jb/etc/modafinil-relay.plist, then scan the private QR code in \
-            Modafinil Companion on your iPhone.
+            Configure the wake relay (the iPad at home), then scan the private QR code \
+            in Modafinil Companion on your iPhone. To wake a second Mac with the same \
+            relay, copy the relay secret on the first Mac and paste it here.
             """
         )
         explanation.textColor = .secondaryLabelColor
         explanation.maximumNumberOfLines = 0
-        explanation.preferredMaxLayoutWidth = 652
+        explanation.preferredMaxLayoutWidth = 772
         content.addArrangedSubview(explanation)
 
         content.addArrangedSubview(makeSeparator())
@@ -129,12 +129,12 @@ private final class CompanionSetupViewController: NSViewController {
         macHostField.isSelectable = true
 
         form.addArrangedSubview(
-            makeRow(title: "XR Tailscale host", field: relayHostField)
+            makeRow(title: "Relay Tailscale host", field: relayHostField)
         )
         relayHostField.placeholderString = "100.x.y.z or MagicDNS name"
 
         form.addArrangedSubview(
-            makeRow(title: "XR relay port", field: relayPortField)
+            makeRow(title: "Relay port", field: relayPortField)
         )
 
         form.addArrangedSubview(
@@ -144,7 +144,7 @@ private final class CompanionSetupViewController: NSViewController {
 
         let macHint = NSTextField(
             wrappingLabelWithString: """
-            Prefilled from Wi-Fi. Enter up to four comma-separated addresses if macOS uses private addresses.
+            Prefilled from Ethernet and Wi-Fi. Enter up to four comma-separated addresses if macOS uses private addresses.
             """
         )
         macHint.font = .systemFont(ofSize: 11)
@@ -174,7 +174,15 @@ private final class CompanionSetupViewController: NSViewController {
         )
         relaySecretButton.bezelStyle = .rounded
 
-        let editActions = NSStackView(views: [saveButton, resetButton, relaySecretButton])
+        let pasteRelaySecretButton = NSButton(
+            title: "Paste Relay Secret",
+            target: self,
+            action: #selector(pasteRelaySecret)
+        )
+        pasteRelaySecretButton.bezelStyle = .rounded
+        pasteRelaySecretButton.toolTip = "Use the relay secret copied from another Mac, so the same iPad relay can wake this Mac too."
+
+        let editActions = NSStackView(views: [saveButton, resetButton, relaySecretButton, pasteRelaySecretButton])
         editActions.orientation = .horizontal
         editActions.spacing = 8
         form.addArrangedSubview(editActions)
@@ -222,7 +230,7 @@ private final class CompanionSetupViewController: NSViewController {
 
         NSLayoutConstraint.activate([
             body.widthAnchor.constraint(equalTo: content.widthAnchor),
-            form.widthAnchor.constraint(equalToConstant: 440),
+            form.widthAnchor.constraint(equalToConstant: 560),
             qrColumn.widthAnchor.constraint(equalToConstant: 188)
         ])
 
@@ -269,7 +277,7 @@ private final class CompanionSetupViewController: NSViewController {
                 in: .whitespacesAndNewlines
             )
             guard !relayHost.isEmpty else {
-                throw SetupError("Enter the XR's Tailscale address.")
+                throw SetupError("Enter the relay's Tailscale address.")
             }
 
             configurationStore.updatePairing(
@@ -291,7 +299,7 @@ private final class CompanionSetupViewController: NSViewController {
         alert.messageText = "Generate new pairing secrets?"
         alert.informativeText = """
         Existing iPhone pairings will stop working until you scan the new QR \
-        code, and the XR relay will reject wake requests until you provision \
+        code, and the wake relay will reject wake requests until you provision \
         the new relay secret on it.
         """
         alert.alertStyle = .warning
@@ -313,9 +321,21 @@ private final class CompanionSetupViewController: NSViewController {
         )
         statusLabel.textColor = .systemGreen
         statusLabel.stringValue = """
-        Relay secret copied. Write it as SharedSecret in \
-        /var/jb/etc/modafinil-relay.plist on the XR (root-owned, mode 0600).
+        Relay secret copied. Paste it into Companion Setup on another Mac, or write it \
+        as SharedSecret in /etc/modafinil-relay.plist on the relay (root-owned, mode 0600).
         """
+    }
+
+    @objc private func pasteRelaySecret() {
+        let text = NSPasteboard.general.string(forType: .string) ?? ""
+        if configurationStore.importRelaySecret(base64: text) {
+            statusLabel.textColor = .systemGreen
+            statusLabel.stringValue = "Relay secret saved. This Mac now shares the iPad relay with the Mac it came from."
+            refresh()
+        } else {
+            statusLabel.textColor = .systemRed
+            statusLabel.stringValue = "The clipboard does not hold a relay secret. On the other Mac, click Copy Relay Secret first."
+        }
     }
 
     @objc private func copyPairingLink() {
@@ -349,7 +369,7 @@ private final class CompanionSetupViewController: NSViewController {
                 """
             } else if configuration.relayHost.isEmpty {
                 statusLabel.textColor = .secondaryLabelColor
-                statusLabel.stringValue = "Enter the XR's Tailscale address to create the QR code."
+                statusLabel.stringValue = "Enter the relay's Tailscale address to create the QR code."
             } else {
                 statusLabel.textColor = .systemRed
                 statusLabel.stringValue = "Enter 1–4 valid comma-separated MAC addresses."
@@ -366,7 +386,7 @@ private final class CompanionSetupViewController: NSViewController {
 
     private func validatedRelayPort() throws -> UInt16 {
         guard let port = UInt16(relayPortField.stringValue), port != 0 else {
-            throw SetupError("Enter a valid XR relay port.")
+            throw SetupError("Enter a valid relay port.")
         }
         return port
     }

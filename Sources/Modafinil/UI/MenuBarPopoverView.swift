@@ -65,6 +65,7 @@ struct MenuBarPopoverView: View {
                 row("iPhone", symbol: "iphone", tint: .blue) {
                     Text(snapshot.companionStatus).foregroundStyle(.secondary)
                 }
+                if snapshot.hasBuiltInLid {
                 row("Sleep when T3 finishes", symbol: "moon.stars.fill", tint: .indigo) {
                     if snapshot.isT3SleepEnabled {
                         if let sleepAt = snapshot.t3SleepAt, sleepAt > now {
@@ -84,6 +85,8 @@ struct MenuBarPopoverView: View {
                 .help(snapshot.isT3SleepEnabled
                       ? (snapshot.t3Status ?? "") + ". With the lid closed, the Mac sleeps 1 minute after T3 finishes."
                       : "Off. Turn on to sleep the Mac with the lid closed once T3 Code threads finish.")
+                }
+                OtherMacsPopoverSection()
             }
 
             VStack(alignment: .leading, spacing: 6) {

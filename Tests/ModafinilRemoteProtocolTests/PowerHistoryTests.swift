@@ -12,6 +12,7 @@ final class PowerHistoryTests: XCTestCase {
         XCTAssertEqual(PowerReason.wakeCause("smc.70070000 wifibt SMC.OutboxNotEmpty E_RX_IP_PACKET ARPT"), .network)
         XCTAssertEqual(PowerReason.wakeCause("smc.70070000 wifibt SMC.OutboxNotEmpty"), .network)
         XCTAssertEqual(PowerReason.wakeCause("HID Activity"), .userInput)
+        XCTAssertEqual(PowerReason.wakeCause("smc.70070000 enet SMC.OutboxNotEmpty lan0/"), .network)
         XCTAssertEqual(PowerReason.wakeCause(nil), .unknown)
         XCTAssertTrue(PowerReason.WakeCause.maintenance.isHousekeeping)
         XCTAssertTrue(PowerReason.WakeCause.backgroundTask.isHousekeeping)

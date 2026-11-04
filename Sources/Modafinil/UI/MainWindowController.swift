@@ -5,8 +5,8 @@ import SwiftUI
 final class MainWindowController: NSWindowController, NSWindowDelegate {
     var onClose: (() -> Void)?
 
-    init(model: AppUIModel) {
-        let host = NSHostingController(rootView: MainWindowView().environmentObject(model))
+    init(model: AppUIModel, remoteMacs: RemoteMacsController) {
+        let host = NSHostingController(rootView: MainWindowView().environmentObject(model).environmentObject(remoteMacs))
         host.sizingOptions = []
         let window = NSWindow(contentViewController: host)
         window.styleMask = [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView]

@@ -1,4 +1,9 @@
 import AppKit
+import Foundation
+
+if CompanionCommandLine.handles(CommandLine.arguments) {
+    exit(CompanionCommandLine.run(CommandLine.arguments))
+}
 
 // The app delegate drives SwiftUI views and is main-actor isolated.
 MainActor.assumeIsolated {

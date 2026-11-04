@@ -59,6 +59,40 @@ restored and both test timers were cleared. Because power was connected during
 sleep, this validates the sleep path and recovery but is not an isolated proof
 of the scheduled wake source.
 
+## Control another Mac, and Mac mini support (Mac 0.10.0)
+
+**Other Macs** (sidebar page and menu bar card) wakes another Mac running Modafinil, keeps it
+awake, or puts it to sleep, for example a Mac mini workstation from a MacBook:
+
+- Add a Mac by pasting the pairing link from that Mac's **Companion Setup → Copy Pairing Link**.
+  The link is stored only in this Mac's login keychain. **⋯ → Show iPhone Pairing Code** shows
+  the same Mac's QR code, so the iPhone can pair with it from here.
+- **Wake & Keep Awake** tries the Mac directly, then for up to 60 seconds sends Wake-on-LAN
+  packets from this Mac to its local networks (reaches the other Mac when both are home) and
+  asks the iPad relay over Tailscale (works away from home), exactly like the iPhone.
+- **Sleep** (with confirmation) and **Sleep After…** use the other Mac's own sleep path, so
+  sleep receipts and remote-wake arming work as for the iPhone.
+- Status is read when the page or the menu bar card opens (at most every 10 s) and after an
+  action, never in the background.
+- The first local Wake-on-LAN may ask for **Local Network** access; allow it.
+
+On a desktop Mac (no lid) Modafinil hides "Sleep when T3 finishes", lists connected Ethernet
+first among its wake addresses, and lights the display after a remote **Wake & Keep Awake**.
+**Companion Setup → Paste Relay Secret** lets a second Mac use the relay secret of the first,
+so one iPad relay wakes both.
+
+Setup over SSH (run inside the logged-in session, e.g. `sudo launchctl asuser <uid> sudo -u
+<user> …`, so the login keychain is available); secrets travel only over stdin/stdout:
+
+```sh
+Modafinil --companion-relay-secret                 # on the first Mac
+Modafinil --companion-set-relay <relay host> 48766 < secret   # on the second Mac
+Modafinil --companion-pairing-link                 # the second Mac's pairing link
+Modafinil --remote-mac-add < link                  # on the controlling Mac
+Modafinil --remote-mac status|wake|sleep <name>    # scripting
+Modafinil --install-helper                         # then approve in Login Items
+```
+
 ## Quit apps that keep the Mac awake before sleep (Mac 0.9.0)
 
 Optional, in **Settings → Before sleeping** or the right-click menu. When Modafinil puts

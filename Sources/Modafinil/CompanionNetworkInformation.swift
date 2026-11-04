@@ -7,26 +7,37 @@ struct CompanionNetworkInformation {
     let wifiInterface: String?
     let wifiMACAddress: String?
     let wifiHardwareMACAddress: String?
+    /// Addresses of connected wired Ethernet ports (a Mac mini's built-in port).
+    /// Wake-on-LAN over a cable is the most reliable wake path, so they come first.
+    var ethernetMACAddresses: [String] = []
 
     static func discover() -> Self {
-        let wifi = discoverWiFiInterface()
+        let ports = discoverHardwarePorts()
+        let wifi = ports.first { $0.name == "Wi-Fi" }
+        let ethernet = ports.filter(\.isWiredEthernet)
+            .filter { isActive(interface: $0.interface) }
+            // Wired ports have no private address, and the hardware address is not
+            // redacted the way macOS 27 redacts `ifconfig` output for apps.
+            .compactMap { $0.hardwareMAC?.lowercased() ?? currentMACAddress(interface: $0.interface) }
         return Self(
             tailscaleIPv4: discoverTailscaleIPv4(),
             wifiInterface: wifi?.interface,
             wifiMACAddress: wifi.flatMap { currentMACAddress(interface: $0.interface) },
-            wifiHardwareMACAddress: wifi?.hardwareMAC
+            wifiHardwareMACAddress: wifi?.hardwareMAC,
+            ethernetMACAddresses: ethernet
         )
     }
 
-    /// Prefer the live per-network address, retain the hardware fallback, then
-    /// preserve configured extra interfaces within the relay's four-target cap.
+    /// Prefer connected Ethernet, then the live per-network Wi-Fi address, retain the
+    /// hardware fallback, then preserve configured extra interfaces within the relay's
+    /// four-target cap.
     func wakeTargetMACs(configured: String? = nil) -> String? {
         var addresses: [String] = []
-        let candidates = [wifiMACAddress, wifiHardwareMACAddress].compactMap { $0 }
+        let candidates = ethernetMACAddresses + [wifiMACAddress, wifiHardwareMACAddress].compactMap { $0 }
             + (configured?.components(separatedBy: ",") ?? [])
         for candidate in candidates {
             guard let valid = PairingConfiguration.normalizedWakeTargets(candidate),
-                  !addresses.contains(valid) else { continue }
+                  valid != Self.redactedMACAddress, !addresses.contains(valid) else { continue }
             addresses.append(valid)
             if addresses.count == 4 { break }
         }
@@ -80,30 +91,48 @@ struct CompanionNetworkInformation {
         return octets[0] == 100 && (64...127).contains(octets[1])
     }
 
-    private static func discoverWiFiInterface() -> (interface: String, hardwareMAC: String?)? {
+    struct HardwarePort {
+        let name: String
+        let interface: String
+        let hardwareMAC: String?
+
+        /// "Ethernet" (built in), "Thunderbolt Ethernet Slot 1", "USB 10/100/1000 LAN".
+        /// "Ethernet Adapter (en4)" entries are virtual and never wake the Mac.
+        var isWiredEthernet: Bool {
+            (name.contains("Ethernet") && !name.hasPrefix("Ethernet Adapter")) || name.hasSuffix(" LAN")
+        }
+    }
+
+    static func discoverHardwarePorts() -> [HardwarePort] {
         guard let output = try? Shell.run(
             "/usr/sbin/networksetup",
             ["-listallhardwareports"]
         ) else {
-            return nil
+            return []
         }
+        return parseHardwarePorts(output)
+    }
 
+    static func parseHardwarePorts(_ output: String) -> [HardwarePort] {
+        var ports: [HardwarePort] = []
         for block in output.components(separatedBy: "\n\n") {
             let lines = block.components(separatedBy: .newlines)
-            guard lines.contains(where: { $0 == "Hardware Port: Wi-Fi" }) else {
-                continue
+            func value(_ prefix: String) -> String? {
+                lines.first(where: { $0.hasPrefix(prefix) })?
+                    .dropFirst(prefix.count).trimmingCharacters(in: .whitespacesAndNewlines)
             }
-
-            guard let interface = lines.first(where: { $0.hasPrefix("Device: ") })?
-                .dropFirst("Device: ".count).trimmingCharacters(in: .whitespacesAndNewlines)
-            else { continue }
-            let hardwareMAC = lines.first(where: { $0.hasPrefix("Ethernet Address: ") })?
-                .dropFirst("Ethernet Address: ".count).trimmingCharacters(in: .whitespacesAndNewlines)
-            return (interface, hardwareMAC)
-
+            guard let name = value("Hardware Port: "), let interface = value("Device: ") else { continue }
+            ports.append(HardwarePort(name: name, interface: interface, hardwareMAC: value("Ethernet Address: ")))
         }
+        return ports
+    }
 
-        return nil
+    /// True when the interface reports a connected link ("status: active").
+    private static func isActive(interface: String) -> Bool {
+        guard let output = try? Shell.run("/sbin/ifconfig", [interface]) else { return false }
+        return output.components(separatedBy: .newlines).contains {
+            $0.trimmingCharacters(in: .whitespaces) == "status: active"
+        }
     }
 
     private static func currentMACAddress(interface: String) -> String? {
@@ -116,12 +145,15 @@ struct CompanionNetworkInformation {
             guard fields.count == 2, fields[0] == "ether" else { continue }
 
             let candidate = String(fields[1]).lowercased()
-            guard isMACAddress(candidate) else { continue }
+            // macOS 27 reports 02:00:00:00:00:00 to apps instead of the real address.
+            guard isMACAddress(candidate), candidate != redactedMACAddress else { continue }
             return candidate
         }
 
         return nil
     }
+
+    private static let redactedMACAddress = "02:00:00:00:00:00"
 
     private static func isMACAddress(_ value: String) -> Bool {
         let bytes = value.split(separator: ":")

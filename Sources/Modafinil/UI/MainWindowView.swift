@@ -103,9 +103,7 @@ struct OverviewPage: View {
                 }
             }
 
-            if snapshot.hasBuiltInLid {
-                T3SleepCard(snapshot: snapshot) { model.actions?.uiToggleT3Sleep() }
-            }
+            T3SleepCard(snapshot: snapshot) { model.actions?.uiToggleT3Sleep() }
 
             BlockersCard(blockers: snapshot.blockers, quitsBeforeSleep: snapshot.isQuitBlockersEnabled)
         }
@@ -119,12 +117,12 @@ struct T3SleepCard: View {
     var body: some View {
         Card(title: "Sleep when T3 Code finishes", symbol: "moon.stars.fill") {
             Toggle(isOn: Binding(get: { snapshot.isT3SleepEnabled }, set: { _ in toggle() })) {
-                Text("Sleep with the lid closed once all T3 threads finish")
+                Text(T3SleepWording.toggleTitle)
             }
             .toggleStyle(.switch)
             .accessibilityIdentifier("overviewT3Sleep")
             if !snapshot.isT3SleepEnabled {
-                Text("Off. The Mac stays awake with the lid closed for as long as keep-awake is on.")
+                Text(T3SleepWording.off)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else if let sleepAt = snapshot.t3SleepAt, sleepAt > Date() {
@@ -151,10 +149,12 @@ struct T3SleepCard: View {
             }
             if snapshot.isT3SleepEnabled {
             Text(snapshot.isKeepAwakeRequested
-                 ? "With the lid closed and no external display, the Mac sleeps 1 minute after the last T3 thread stops working or waiting. Keep-awake turns back on when you open the lid."
+                 ? T3SleepWording.rule
                  : snapshot.isT3RestorePending
-                 ? "The Mac slept after T3 Code finished. Keep-awake turns back on when you open the lid."
-                 : "Turn keep-awake on for this to apply. Without it, closing the lid sleeps the Mac right away.")
+                 ? T3SleepWording.restore
+                 : snapshot.hasBuiltInLid
+                 ? "Turn keep-awake on for this to apply. Without it, closing the lid sleeps the Mac right away."
+                 : "Turn keep-awake on for this to apply. Without it, the Mac sleeps on its normal idle timer.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -493,9 +493,9 @@ struct SettingsPage: View {
                 Toggle(isOn: Binding(
                     get: { snapshot.isT3SleepEnabled },
                     set: { _ in model.actions?.uiToggleT3Sleep() })) {
-                    Text("Sleep when T3 Code threads finish (lid closed)")
+                    Text(T3SleepWording.shortTitle)
                     Text(snapshot.t3Status.map { "\($0). " } ?? "")
-                        + Text("Sleeps 1 minute after no thread is working or waiting. Keep-awake turns back on when you open the lid.")
+                        + Text(T3SleepWording.rule)
                 }
                 .accessibilityIdentifier("t3SleepToggle")
             }

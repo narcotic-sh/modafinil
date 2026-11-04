@@ -80,6 +80,7 @@ struct OtherMacsPage: View {
                     Text("• Commands go over Tailscale and are signed with that Mac’s secret, kept in this Mac’s keychain.")
                     Text("• Wake sends Wake-on-LAN packets from this Mac when it is on the same home network, and asks the iPad relay at the same time, so it also works away from home.")
                     Text("• The other Mac turns keep-awake on once it answers. Sleep turns keep-awake off and puts it to sleep.")
+                    Text("• “Sleep when T3 Code finishes” is that Mac’s own setting and counts only the T3 threads running on it. On a Mac mini it applies once nobody has used its keyboard or mouse for 5 minutes.")
                     Text("• Status is checked when this page or the menu bar card opens, never in the background.")
                 }
                 .font(.callout)
@@ -126,6 +127,30 @@ struct OtherMacsPage: View {
                             Text(timerInterval: Date()...date, countsDown: true).monospacedDigit()
                         }
                         .font(.callout).foregroundStyle(.indigo)
+                    }
+                    if let t3 = mac.t3Sleep {
+                        Toggle(isOn: Binding(get: { t3.enabled },
+                                             set: { enabled in Task { await macs.setT3Sleep(mac.id, enabled: enabled) } })) {
+                            Text("Sleep when T3 Code finishes")
+                        }
+                        .toggleStyle(.switch)
+                        .disabled(mac.phase.isBusy || mac.phase == .unreachable)
+                        .accessibilityIdentifier("otherMacT3Sleep-\(mac.name)")
+                        if t3.enabled {
+                            if let sleepAt = t3.sleepAt.map({ Date(timeIntervalSince1970: TimeInterval($0)) }), sleepAt > Date() {
+                                HStack(spacing: 4) {
+                                    Text("T3 finished. Sleeping in")
+                                    Text(timerInterval: Date()...sleepAt, countsDown: true).monospacedDigit()
+                                }
+                                .font(.callout).foregroundStyle(.indigo)
+                            } else {
+                                Text(t3.summary).font(.callout).foregroundStyle(.secondary)
+                            }
+                        }
+                        if t3.restorePending {
+                            Text("It slept after T3 finished. Wake & Keep Awake turns keep-awake back on.")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
                     }
                     if let attempt = mac.sleepAttempt, attempt.phase == .failed,
                        Date().timeIntervalSince1970 - Double(attempt.requestedAt) < 15 * 60 {
@@ -274,10 +299,31 @@ struct OtherMacsPopoverSection: View {
                         .help("Wake \(mac.name) and keep it awake")
                         .disabled(mac.phase.isBusy)
                         .accessibilityIdentifier("popoverWake-\(mac.name)")
-                        Button { Task { await macs.sleepNow(mac.id) } } label: {
+                        Menu {
+                            Button("Sleep Now") { Task { await macs.sleepNow(mac.id) } }
+                            if let date = mac.scheduledSleepAt, date > Date() {
+                                Button("Cancel Sleep Timer (\(UIFormat.time(date)))") { Task { await macs.cancelSleepTimer(mac.id) } }
+                            } else {
+                                Menu("Sleep After") {
+                                    ForEach([("15 minutes", 15), ("30 minutes", 30), ("1 hour", 60), ("2 hours", 120),
+                                             ("4 hours", 240), ("8 hours", 480)], id: \.1) { title, minutes in
+                                        Button(title) { Task { await macs.sleep(mac.id, after: minutes * 60) } }
+                                    }
+                                }
+                            }
+                            if let t3 = mac.t3Sleep {
+                                Divider()
+                                Toggle("Sleep When T3 Code Finishes", isOn: Binding(
+                                    get: { t3.enabled },
+                                    set: { enabled in Task { await macs.setT3Sleep(mac.id, enabled: enabled) } }))
+                            }
+                        } label: {
                             Image(systemName: "moon.zzz.fill")
                         }
-                        .help("Put \(mac.name) to sleep")
+                        .menuStyle(.borderlessButton)
+                        .menuIndicator(.hidden)
+                        .fixedSize()
+                        .help("Sleep \(mac.name) now or later")
                         .disabled(mac.phase.isBusy || mac.phase == .unreachable)
                         .accessibilityIdentifier("popoverSleep-\(mac.name)")
                     }

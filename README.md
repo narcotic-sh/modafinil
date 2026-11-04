@@ -59,6 +59,24 @@ restored and both test timers were cleared. Because power was connected during
 sleep, this validates the sleep path and recovery but is not an isolated proof
 of the scheduled wake source.
 
+## Sleep when T3 finishes on a Mac mini, and only local threads (Mac 0.11.0)
+
+- **Desktop rule.** On a Mac without a lid the rule applies once nobody has used the keyboard
+  or mouse for 5 minutes; displays do not matter (a headless Mac mini often has a monitor
+  plugged in but off). It then sleeps 1 minute after the last T3 thread on that Mac finishes.
+  Using the Mac again, or Wake & Keep Awake from the iPhone or another Mac, turns keep-awake
+  back on. After a remote wake it waits for a T3 run to start, at most 30 minutes on a desktop.
+- **Short runs count.** While waiting after a remote wake, a run that started and ended between
+  two 15-second checks is noticed from its start time.
+- **Only this Mac's threads.** Work delegated to a linked T3 environment (another Mac) no longer
+  counts as local background work; that Mac's own Modafinil counts the thread doing the work.
+  A running tool call without a `persistent` flag now counts as intended (a NULL comparison
+  used to drop it).
+- **Other Macs** shows each Mac's T3 status with an on/off switch; the menu bar row's sleep
+  button opens Sleep Now, Sleep After… and the T3 switch.
+- `Modafinil --t3-activity` prints what the rule counts on this Mac;
+  `--remote-mac t3sleep-on|t3sleep-off <name>` switches it on another Mac.
+
 ## Control another Mac, and Mac mini support (Mac 0.10.0)
 
 **Other Macs** (sidebar page and menu bar card) wakes another Mac running Modafinil, keeps it

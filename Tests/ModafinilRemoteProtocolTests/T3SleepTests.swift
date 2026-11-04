@@ -82,6 +82,29 @@ final class T3ActivityReaderTests: XCTestCase {
         XCTAssertEqual(Set(threads.map(\.title)), ["Shell", "Agent"])
     }
 
+    /// A task delegated to a linked environment (the Mac mini) runs on that Mac; the
+    /// local thread waiting on it must not keep this Mac awake.
+    func testWorkDelegatedToAnotherMacDoesNotCount() throws {
+        try writeRuntime(pid: 4242)
+        let db = try makeDatabase(runs: [("a", "Waits on mini", "completed", nil), ("b", "Reads mini", "completed", nil),
+                                         ("c", "Remote task", "completed", nil), ("d", "Local tool", "completed", nil),
+                                         ("e", "Local task", "completed", nil)])
+        try exec(db, """
+            CREATE TABLE peer_environment_links (environment_id TEXT PRIMARY KEY, label TEXT NOT NULL);
+            INSERT INTO peer_environment_links VALUES ('env-mini', 'Mac mini');
+            """)
+        try addItem(db, thread: "a", type: "dynamic_tool", status: "running",
+                    input: #"{"title":"Render","target":{"environmentId":"env-mini"}}"#)
+        try addItem(db, thread: "b", type: "dynamic_tool", status: "running",
+                    input: #"{"threadId":"t1","environmentId":"env-mini"}"#)
+        try addProviderThread(db, id: "pt-c", thread: "c",
+                              tasks: #"[{"taskId":"node:delegated-task:x%3Aremote-delegate%3Ay","kind":"subagent"}]"#)
+        try addItem(db, thread: "d", type: "dynamic_tool", status: "running", input: #"{"title":"Local"}"#)
+        try addProviderThread(db, id: "pt-e", thread: "e", tasks: #"[{"taskId":"bub","kind":"command"}]"#)
+        guard case .busy(let threads) = reader(alive: true).read() else { return XCTFail("expected busy") }
+        XCTAssertEqual(Set(threads.map(\.title)), ["Local tool", "Local task"])
+    }
+
     func testAThreadIsListedOnceWhenItsRunIsActive() throws {
         try writeRuntime(pid: 4242)
         let db = try makeDatabase(runs: [("a", "Build", "running", nil)])
@@ -278,6 +301,48 @@ final class T3SleepWatchTests: XCTestCase {
         conditions = closed; conditions.isEnabled = false
         XCTAssertEqual(watch.evaluate(conditions, now: start, activity: read), .notWatching)
         XCTAssertEqual(readCount, 0, "T3 is read only while the lid is closed")
+    }
+
+    func testDesktopWatchesWhenNobodyUsesItWhateverTheDisplays() {
+        var watch = T3SleepWatch(gracePeriod: 60)
+        var desktop = T3SleepWatch.Conditions(isEnabled: true, isKeepAwakeOn: true, isLidClosed: nil,
+                                              hasExternalDisplay: true, isDesktop: true, userIdleSeconds: 299)
+        XCTAssertEqual(watch.evaluate(desktop, now: start) { .idle }, .notWatching, "someone used it recently")
+        desktop.userIdleSeconds = 300
+        XCTAssertEqual(watch.evaluate(desktop, now: start) { .idle },
+                       .waitingForGrace(sleepAt: start.addingTimeInterval(60)))
+        XCTAssertEqual(watch.evaluate(desktop, now: start.addingTimeInterval(60)) { .idle }, .sleepNow)
+        desktop.isKeepAwakeOn = false
+        XCTAssertEqual(watch.evaluate(desktop, now: start) { .idle }, .notWatching)
+    }
+
+    func testDesktopRemoteWakeWaitsAtMostThirtyMinutesForNewWork() {
+        var watch = T3SleepWatch(gracePeriod: 60)
+        let desktop = T3SleepWatch.Conditions(isEnabled: true, isKeepAwakeOn: true, isLidClosed: nil,
+                                              hasExternalDisplay: false, isDesktop: true, userIdleSeconds: 3600)
+        watch.waitForNewActivity(now: start)
+        XCTAssertEqual(watch.evaluate(desktop, now: start.addingTimeInterval(29 * 60)) { .idle }, .waitingForActivity)
+        XCTAssertEqual(watch.evaluate(desktop, now: start.addingTimeInterval(30 * 60)) { .idle },
+                       .waitingForGrace(sleepAt: start.addingTimeInterval(31 * 60)))
+        XCTAssertFalse(watch.waitsForNewActivity)
+        // A laptop keeps waiting: someone may open the lid.
+        var laptop = T3SleepWatch(gracePeriod: 60)
+        laptop.waitForNewActivity(now: start)
+        XCTAssertEqual(laptop.evaluate(closed, now: start.addingTimeInterval(3 * 3600)) { .idle }, .waitingForActivity)
+    }
+
+    /// 2026-11-04: an 8-second T3 run on the Mac mini fell between two 15 s checks.
+    func testARunThatStartedAfterTheWakeEndsTheWaitEvenIfAlreadyFinished() {
+        var watch = T3SleepWatch(gracePeriod: 60)
+        watch.waitForNewActivity(now: start)
+        watch.noteRunStarted(at: start.addingTimeInterval(-5))
+        XCTAssertTrue(watch.waitsForNewActivity, "a run from before the wake does not count")
+        watch.noteRunStarted(at: start.addingTimeInterval(10))
+        XCTAssertFalse(watch.waitsForNewActivity)
+        XCTAssertEqual(watch.evaluate(closed, now: start.addingTimeInterval(20)) { .idle },
+                       .waitingForGrace(sleepAt: start.addingTimeInterval(80)))
+        XCTAssertEqual(T3ActivityReader.parseTimestamp("2026-11-04T17:23:29.890Z"),
+                       Date(timeIntervalSince1970: 1_793_813_009.89))
     }
 
     func testOpeningTheLidResetsTheGracePeriod() {

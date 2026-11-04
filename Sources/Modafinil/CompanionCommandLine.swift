@@ -1,5 +1,6 @@
 import Foundation
 import ModafinilRemoteProtocol
+import ModafinilT3
 
 /// Setup over SSH, for a Mac without a screen nearby (for example a Mac mini):
 ///
@@ -8,14 +9,15 @@ import ModafinilRemoteProtocol
 ///     Modafinil --companion-pairing-link            # print this Mac's pairing link
 ///     Modafinil --remote-mac-add < pairing-link.txt # control another Mac from this one
 ///     Modafinil --remote-mac-list
-///     Modafinil --remote-mac status|wake|sleep <name or address>
+///     Modafinil --remote-mac status|wake|sleep|t3sleep-on|t3sleep-off <name or address>
+///     Modafinil --t3-activity                       # what "Sleep when T3 finishes" counts here
 ///     Modafinil --install-helper                    # register the helper; approve it in Login Items
 ///
 /// Secrets travel through standard input and output, never the argument list.
 /// Run in the logged-in user's session so the login keychain is available.
 enum CompanionCommandLine {
     static func handles(_ arguments: [String]) -> Bool {
-        arguments.count > 1 && (arguments[1].hasPrefix("--companion-") || arguments[1].hasPrefix("--remote-mac") || arguments[1] == "--install-helper")
+        arguments.count > 1 && (arguments[1].hasPrefix("--companion-") || arguments[1].hasPrefix("--remote-mac") || arguments[1] == "--install-helper" || arguments[1] == "--t3-activity")
     }
 
     static func run(_ arguments: [String]) -> Int32 {
@@ -59,14 +61,23 @@ enum CompanionCommandLine {
             print("Added \(configuration.displayName) (\(configuration.macHost)).")
             return 0
         case "--remote-mac":
-            guard rest.count == 2, ["status", "wake", "sleep"].contains(rest[0]) else {
-                return fail("Usage: --remote-mac status|wake|sleep <name or address>")
+            guard rest.count == 2, ["status", "wake", "sleep", "t3sleep-on", "t3sleep-off"].contains(rest[0]) else {
+                return fail("Usage: --remote-mac status|wake|sleep|t3sleep-on|t3sleep-off <name or address>")
             }
             return runRemoteMacCommand(rest[0], target: rest[1])
         case "--remote-mac-list":
             for mac in (try? RemoteMacStore().load()) ?? [] {
                 print("\(mac.displayName)\t\(mac.macHost):\(mac.macPort)\trelay \(mac.relayHost):\(mac.relayPort)\twake \(mac.targetMAC)")
             }
+            return 0
+        case "--t3-activity":
+            let activity = T3ActivityReader().read()
+            print(activity.summary)
+            if case .busy(let threads) = activity {
+                for thread in threads { print("  [\(thread.status)] \(thread.title)") }
+            }
+            if let idle = LidMonitor.userIdleSeconds() { print("Keyboard/mouse idle: \(Int(idle)) s") }
+            print(LidMonitor.hasBuiltInLid ? "Rule: lid closed, no external display" : "Rule: nobody used the Mac for 5 min")
             return 0
         case "--install-helper":
             let installer = PrivilegedHelperInstaller()
@@ -102,11 +113,16 @@ enum CompanionCommandLine {
             switch action {
             case "wake": await controller.wakeAndKeepAwake(mac.id)
             case "sleep": await controller.sleepNow(mac.id)
+            case "t3sleep-on", "t3sleep-off": await controller.setT3Sleep(mac.id, enabled: action == "t3sleep-on")
             default: await controller.refresh(mac.id)
             }
             let phase = controller.macs.first { $0.id == mac.id }?.phase ?? .unknown
             var line = "\(mac.name): \(phase.title) after \(String(format: "%.1f", Date().timeIntervalSince(started))) s"
             if case .failed(let message) = phase { line += " — \(message)" }
+            if let t3 = controller.macs.first(where: { $0.id == mac.id })?.t3Sleep {
+                line += "\n  Sleep when T3 finishes: \(t3.enabled ? "on" : "off") — \(t3.summary)"
+                if let at = t3.sleepAt { line += " (sleeps at \(UIFormat.time(Date(timeIntervalSince1970: TimeInterval(at)))))" }
+            }
             print(line)
             switch phase {
             case .failed: code = 1

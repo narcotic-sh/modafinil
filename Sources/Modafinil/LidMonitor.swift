@@ -108,6 +108,17 @@ final class LidMonitor {
                                                kCFAllocatorDefault, 0)?.takeRetainedValue() != nil
     }()
 
+    /// Seconds since the last keyboard, mouse or trackpad input (IOHIDSystem).
+    static func userIdleSeconds() -> TimeInterval? {
+        let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOHIDSystem"))
+        guard service != IO_OBJECT_NULL else { return nil }
+        defer { IOObjectRelease(service) }
+        guard let value = IORegistryEntryCreateCFProperty(service, "HIDIdleTime" as CFString,
+                                                          kCFAllocatorDefault, 0)?.takeRetainedValue() as? NSNumber
+        else { return nil }
+        return value.doubleValue / 1_000_000_000
+    }
+
     func isLidClosed() -> Bool? {
         guard rootDomain != IO_OBJECT_NULL else { return nil }
 

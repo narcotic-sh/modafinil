@@ -72,6 +72,8 @@ final class AppDelegate: NSObject,
     private var lastT3Activity: T3Activity?
     private var lastT3ActivityAt: Date?
     private var t3SleepAt: Date?
+    /// Last remote Wake & Keep Awake (or wake alarm), for telling it apart from real input.
+    private var lastRemoteKeepAwakeAt: Date?
     private var isQuitBlockersEnabled = UserDefaults.standard.bool(forKey: AppDelegate.quitBlockersDefaultsKey)
     private var quitBlockersTimer: Timer?
     private var quitBlockersArmedFor: Date?
@@ -911,7 +913,7 @@ final class AppDelegate: NSObject,
             }
             setT3SleepEnabled(enabled, source: "iPhone")
             completion(.success((makeRemoteState(), enabled
-                ? "The Mac will sleep with the lid closed once T3 Code threads finish."
+                ? "The Mac will sleep once T3 Code threads finish and \(T3SleepWording.condition)."
                 : "Sleep when T3 Code finishes is off.")))
         case .keepAwake:
             performRemoteKeepAwake(completion: completion)
@@ -1105,6 +1107,7 @@ final class AppDelegate: NSObject,
                 // iPhone woke it.
                 // Only a closed-lid wake with the feature on needs the wait; a wait
                 // left over from an open-lid wake would block the rule later.
+                self.lastRemoteKeepAwakeAt = Date()
                 if self.isT3SleepEnabled, self.lidMonitor.isLidClosed() != false {
                     self.t3SleepWatch.waitForNewActivity()
                     self.t3SleepAt = nil
@@ -1237,9 +1240,7 @@ final class AppDelegate: NSObject,
                                    detail: $0.details.first.map { String($0.prefix(60)) })
             },
             history: history,
-            // Desktops have no lid, so the closed-lid T3 rule never applies; nil tells
-            // Companion 1.9+ to hide the card.
-            t3Sleep: history != nil || !LidMonitor.hasBuiltInLid ? nil : makeRemoteT3Sleep()
+            t3Sleep: history != nil ? nil : makeRemoteT3Sleep()
         )
     }
 
@@ -1263,7 +1264,11 @@ final class AppDelegate: NSObject,
         }
         var summary = activity.summary
         if t3SleepWatch.waitsForNewActivity, activity.isFinished {
-            summary += " · sleeps after the next T3 run"
+            summary += LidMonitor.hasBuiltInLid ? " · sleeps after the next T3 run"
+                                                : " · sleeps after the next T3 run (or in 30 min)"
+        } else if !LidMonitor.hasBuiltInLid {
+            // Phones and Macs show this line as is; it carries the desktop condition.
+            summary += " · sleeps once unused for 5 min"
         }
         return RemoteT3Sleep(enabled: true, summary: String(summary.prefix(120)),
                              working: working, waiting: waiting,
@@ -1547,7 +1552,7 @@ final class AppDelegate: NSObject,
             endT3WatchActivity()
         }
         // Catches a lid opened while an update was in flight. Rare: only after a T3 sleep.
-        if isKeepAwakeSuspendedForT3Sleep, !isToggleInFlight, lidMonitor.isLidClosed() == false {
+        if isKeepAwakeSuspendedForT3Sleep, !isToggleInFlight, isSomeoneAtTheMac {
             DispatchQueue.main.async { [weak self] in self?.restoreKeepAwakeAfterT3SleepIfLidOpen() }
         }
     }
@@ -1565,8 +1570,19 @@ final class AppDelegate: NSObject,
             isEnabled: isT3SleepEnabled,
             isKeepAwakeOn: isKeepAwakeOnForT3Watch,
             isLidClosed: lidMonitor.isLidClosed(),
-            hasExternalDisplay: LidMonitor.hasExternalDisplay()
+            hasExternalDisplay: LidMonitor.hasExternalDisplay(),
+            isDesktop: !LidMonitor.hasBuiltInLid,
+            userIdleSeconds: LidMonitor.userIdleSeconds()
         )
+        // Desktop: real keyboard or mouse use after a remote wake means someone is here,
+        // like opening a MacBook's lid. The wake's own display wake-up does not count.
+        if conditions.isDesktop, t3SleepWatch.waitsForNewActivity, let idle = conditions.userIdleSeconds,
+           idle < 60, let wokeAt = lastRemoteKeepAwakeAt, Date().timeIntervalSince(wokeAt) > idle + 15 {
+            t3SleepWatch.clearWaitForNewActivity()
+        }
+        if conditions.isWatching, t3SleepWatch.waitsForNewActivity {
+            t3SleepWatch.noteRunStarted(at: t3ActivityReader.latestRunRequestedAt())
+        }
         let previousSleepAt = t3SleepAt
         switch t3SleepWatch.evaluate(conditions, now: Date(), activity: readT3Activity) {
         case .notWatching, .waitingForActivity:
@@ -1601,7 +1617,8 @@ final class AppDelegate: NSObject,
     }
 
     private func performT3Sleep() {
-        historyRecorder.note("T3 Code finished: sleeping with the lid closed")
+        historyRecorder.note(LidMonitor.hasBuiltInLid ? "T3 Code finished: sleeping with the lid closed"
+                                                      : "T3 Code finished: sleeping (nobody used the Mac for 5 min)")
         pendingSleepSource = ("T3 Code finished", Date())
         isKeepAwakeSuspendedForT3Sleep = true
         requestSystemSleep(source: "T3 Code finished") { [weak self] result in
@@ -1619,7 +1636,7 @@ final class AppDelegate: NSObject,
     /// is still being verified, so the helper's receipt cannot undo it.
     private func restoreKeepAwakeAfterT3SleepIfLidOpen() {
         guard isKeepAwakeSuspendedForT3Sleep, !isToggleInFlight, !isQuitInProgress,
-              lidMonitor.isLidClosed() == false else { return }
+              isSomeoneAtTheMac else { return }
         synchronizeSleepJournal()
         guard sleepAttempt?.phase != .pending else { return }
         isKeepAwakeSuspendedForT3Sleep = false
@@ -1628,6 +1645,12 @@ final class AppDelegate: NSObject,
         isSleepPreventionRequested = true
         keepAwakeChangeSource = "lid opened after T3 sleep"
         reconcileSleepPreventionWithCurrentMode()
+    }
+
+    /// The lid is open, or on a desktop the keyboard or mouse was used in the last minute.
+    private var isSomeoneAtTheMac: Bool {
+        if LidMonitor.hasBuiltInLid { return lidMonitor.isLidClosed() == false }
+        return (LidMonitor.userIdleSeconds() ?? .infinity) < 60
     }
 
     private var isKeepAwakeSuspendedForT3Sleep: Bool {
@@ -1802,13 +1825,13 @@ final class AppDelegate: NSObject,
         menu.addItem(codexLimitItem)
 
         let t3SleepItem = NSMenuItem(
-            title: "Sleep When T3 Threads Finish (Lid Closed)",
+            title: LidMonitor.hasBuiltInLid ? "Sleep When T3 Threads Finish (Lid Closed)" : "Sleep When T3 Threads Finish (Unused)",
             action: #selector(toggleT3Sleep),
             keyEquivalent: ""
         )
         t3SleepItem.target = self
         t3SleepItem.state = isT3SleepEnabled ? .on : .off
-        if LidMonitor.hasBuiltInLid { menu.addItem(t3SleepItem) }
+        menu.addItem(t3SleepItem)
 
         let quitBlockersItem = NSMenuItem(
             title: "Quit Apps Keeping the Mac Awake Before Sleep",
@@ -1969,7 +1992,7 @@ final class AppDelegate: NSObject,
         }
 
         if isSleepPreventionEnabled, isT3SleepEnabled {
-            return "Modafinil is keeping your Mac awake. With the lid closed, it sleeps once T3 Code threads finish."
+            return "Modafinil is keeping your Mac awake. When \(T3SleepWording.condition), it sleeps once T3 Code threads finish."
         }
 
         if isSleepPreventionEnabled {
@@ -1986,7 +2009,7 @@ final class AppDelegate: NSObject,
 
         if let attempt = sleepAttempt, [.pending, .failed].contains(attempt.phase) { return attempt.detail }
         if isKeepAwakeSuspendedForT3Sleep {
-            return "The Mac slept after T3 Code finished. Keep-awake turns back on when you open the lid."
+            return T3SleepWording.restore
         }
         return "Modafinil is not preventing sleep. This does not mean the Mac is currently asleep."
     }

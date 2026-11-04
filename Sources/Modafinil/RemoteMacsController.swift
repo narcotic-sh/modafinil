@@ -35,6 +35,8 @@ final class RemoteMacsController: ObservableObject {
         var lastChecked: Date?
         var scheduledSleepAt: Date?
         var sleepAttempt: RemoteSleepAttempt?
+        /// That Mac's "Sleep when T3 Code finishes" setting and T3 status (Mac 0.8.0+).
+        var t3Sleep: RemoteT3Sleep?
         var id: String { RemoteMacStore.identifier(configuration) }
         var name: String { configuration.displayName }
     }
@@ -180,6 +182,12 @@ final class RemoteMacsController: ObservableObject {
         await command(id, .scheduleSleep, argument: String(seconds), working: "Setting sleep timer…")
     }
 
+    /// Turns that Mac's "Sleep when T3 Code finishes" on or off.
+    func setT3Sleep(_ id: String, enabled: Bool) async {
+        await command(id, .setT3Sleep, argument: enabled ? "1" : "0",
+                      working: enabled ? "Turning on sleep when T3 finishes…" : "Turning off sleep when T3 finishes…")
+    }
+
     func cancelSleepTimer(_ id: String) async {
         await command(id, .cancelScheduledSleep, working: "Cancelling sleep timer…")
     }
@@ -231,6 +239,7 @@ final class RemoteMacsController: ObservableObject {
             mac.lastChecked = Date()
             mac.sleepAttempt = state.sleepAttempt
             mac.scheduledSleepAt = state.scheduledSleepAt.map { Date(timeIntervalSince1970: TimeInterval($0)) }
+            mac.t3Sleep = state.t3Sleep
             if state.sleepPreventionEffective { mac.phase = .awake }
             else if state.sleepAttempt?.phase == .pending { mac.phase = .sleepRequested }
             else { mac.phase = .reachable }

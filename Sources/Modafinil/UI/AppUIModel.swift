@@ -122,6 +122,31 @@ final class AppUIModel: ObservableObject {
 
 // MARK: Shared formatting
 
+/// "Sleep when T3 Code finishes" wording: a closed lid on a MacBook, nobody using the
+/// keyboard or mouse on a desktop (a headless Mac mini).
+enum T3SleepWording {
+    static var isDesktop: Bool { !LidMonitor.hasBuiltInLid }
+    static var condition: String { isDesktop ? "nobody has used it for 5 minutes" : "the lid is closed" }
+    static var shortTitle: String { isDesktop ? "Sleep when T3 Code threads finish (unused)" : "Sleep when T3 Code threads finish (lid closed)" }
+    static var toggleTitle: String {
+        isDesktop ? "Sleep once all T3 threads finish and nobody is using the Mac"
+                  : "Sleep with the lid closed once all T3 threads finish"
+    }
+    static var rule: String {
+        isDesktop
+            ? "When no keyboard or mouse has been used for 5 minutes (displays do not matter), the Mac sleeps 1 minute after the last T3 thread on this Mac stops working or waiting. Using the Mac again, or Wake & Keep Awake, turns keep-awake back on. After a remote wake it waits up to 30 minutes for a T3 thread to start."
+            : "With the lid closed and no external display, the Mac sleeps 1 minute after the last T3 thread on this Mac stops working or waiting. Keep-awake turns back on when you open the lid."
+    }
+    static var restore: String {
+        isDesktop ? "The Mac slept after T3 Code finished. Keep-awake turns back on when someone uses it or wakes it remotely."
+                  : "The Mac slept after T3 Code finished. Keep-awake turns back on when you open the lid."
+    }
+    static var off: String {
+        isDesktop ? "Off. The Mac stays awake for as long as keep-awake is on."
+                  : "Off. The Mac stays awake with the lid closed for as long as keep-awake is on."
+    }
+}
+
 enum UIFormat {
     static func duration(_ seconds: Double) -> String {
         let total = Int(seconds.rounded())

@@ -16,6 +16,7 @@ protocol CompanionServerDelegate: AnyObject {
 final class CompanionServer {
     weak var delegate: CompanionServerDelegate?
     var errorHandler: ((String) -> Void)?
+    var authenticatedPeerHandler: ((String) -> Void)?
 
     private var secret: Data
     private let queue = DispatchQueue(label: "com.narcotic.modafinil.companion")
@@ -246,6 +247,7 @@ final class CompanionServer {
             return
         }
 
+        if case .hostPort(let host, _) = connection.endpoint { authenticatedPeerHandler?("\(host)") }
         perform(
             request: request,
             responseSecret: responseSecret,
@@ -380,7 +382,7 @@ final class CompanionServer {
         }
     }
 
-    private static func isAllowedPeer(_ endpoint: NWEndpoint) -> Bool {
+    static func isAllowedPeer(_ endpoint: NWEndpoint) -> Bool {
         guard case .hostPort(let host, _) = endpoint else { return false }
 
         var address = host.debugDescription

@@ -70,8 +70,29 @@ final class RemoteMacsController: ObservableObject {
         reload()
         if !force, let last = lastRefreshAll, Date().timeIntervalSince(last) < 10 { return }
         lastRefreshAll = Date()
-        for mac in macs where !mac.phase.isBusy {
+        for mac in macs where !mac.phase.isBusy && (force || allowsAutomaticContact(mac)) {
             Task { await refresh(mac.id) }
+        }
+    }
+
+    private func allowsAutomaticContact(_ mac: Mac) -> Bool {
+        if mac.phase == .sleepRequested { return false }
+        let url = RemotePowerNotices.directory.appendingPathComponent(mac.configuration.macHost + ".json")
+        if let data = try? Data(contentsOf: url),
+           let value = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           value["sleeping"] as? Bool == true { return false }
+        let quiet = UserDefaults.standard.dictionary(forKey: "remoteMacSleepQuietAfter")?[mac.id] as? Double
+        return SleepContactPolicy(quietAfter: quiet).allowsAutomaticContact()
+    }
+
+    func receivedSleepIntent(host: String, sleeping: Bool) {
+        for mac in macs where mac.configuration.macHost == host {
+            var values = UserDefaults.standard.dictionary(forKey: "remoteMacSleepQuietAfter") ?? [:]
+            values[mac.id] = sleeping ? Date().timeIntervalSince1970 : nil
+            UserDefaults.standard.set(values, forKey: "remoteMacSleepQuietAfter")
+            // A push changes policy, not our knowledge of the physical power state.
+            if sleeping, !mac.phase.isBusy { update(mac.id) { $0.phase = .sleepRequested } }
+            if !sleeping, mac.phase == .sleepRequested { update(mac.id) { $0.phase = .unknown } }
         }
     }
 
@@ -171,11 +192,7 @@ final class RemoteMacsController: ObservableObject {
 
     func sleepNow(_ id: String) async {
         await command(id, .sleep, working: "Putting to sleep…")
-        guard let attempt = mac(id)?.sleepAttempt, attempt.phase == .pending else { return }
-        // No follow-up status check: on Ethernet, a connection attempt can itself wake
-        // a sleeping Mac mini. The next check (when a view opens) shows the result.
-        try? await Task.sleep(for: .seconds(40))
-        if mac(id)?.phase == .sleepRequested { update(id) { $0.phase = .unreachable } }
+
     }
 
     func sleep(_ id: String, after seconds: Int) async {
@@ -211,7 +228,7 @@ final class RemoteMacsController: ObservableObject {
     private func send(_ configuration: PairingConfiguration, _ command: RemoteCommand,
                       argument: String = "", timeout: TimeInterval = 6) async throws -> RemoteResponse {
         var lastError: Error?
-        for version in [RemoteRequest.t3SleepVersion, RemoteRequest.sleepHistoryVersion, RemoteRequest.wakeRecoveryVersion] {
+        for version in [RemoteRequest.sleepIntentVersion, RemoteRequest.t3SleepVersion, RemoteRequest.sleepHistoryVersion, RemoteRequest.wakeRecoveryVersion] {
             do {
                 return try await RemoteMacClient(secret: configuration.secret, protocolVersion: version)
                     .send(command, argument: argument, host: configuration.macHost,
@@ -235,13 +252,18 @@ final class RemoteMacsController: ObservableObject {
             try? store.upsert(updated)
             update(id) { $0.configuration = updated }
         }
+        var quiet = UserDefaults.standard.dictionary(forKey: "remoteMacSleepQuietAfter") ?? [:]
+        if state.sleepIntentActive == true || state.sleepAttempt?.phase == .pending { quiet[id] = Date().timeIntervalSince1970 }
+        else if let date = state.scheduledSleepAt { quiet[id] = Double(date) }
+        else if state.sleepIntentActive == false || state.sleepPreventionEffective || (quiet[id] as? Double ?? 0) > Date().timeIntervalSince1970 { quiet[id] = nil }
+        UserDefaults.standard.set(quiet, forKey: "remoteMacSleepQuietAfter")
         update(id) { mac in
             mac.lastChecked = Date()
             mac.sleepAttempt = state.sleepAttempt
             mac.scheduledSleepAt = state.scheduledSleepAt.map { Date(timeIntervalSince1970: TimeInterval($0)) }
             mac.t3Sleep = state.t3Sleep
             if state.sleepPreventionEffective { mac.phase = .awake }
-            else if state.sleepAttempt?.phase == .pending { mac.phase = .sleepRequested }
+            else if state.sleepIntentActive == true || state.sleepAttempt?.phase == .pending { mac.phase = .sleepRequested }
             else { mac.phase = .reachable }
         }
     }

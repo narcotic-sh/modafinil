@@ -163,6 +163,8 @@ public struct RemoteState: Codable, Equatable, Sendable {
     public let history: RemoteHistory?
     /// Protocol v6.
     public let t3Sleep: RemoteT3Sleep?
+    /// Protocol v7: a sleep choice, not proof that the CPU is asleep now.
+    public let sleepIntentActive: Bool?
 
     public init(
         awakeRequested: Bool,
@@ -174,7 +176,8 @@ public struct RemoteState: Codable, Equatable, Sendable {
         wakeTargetMACs: String? = nil,
         blockers: [RemoteSleepBlocker]? = nil,
         history: RemoteHistory? = nil,
-        t3Sleep: RemoteT3Sleep? = nil
+        t3Sleep: RemoteT3Sleep? = nil,
+        sleepIntentActive: Bool? = nil
     ) {
         self.awakeRequested = awakeRequested
         self.sleepPreventionEffective = sleepPreventionEffective
@@ -186,6 +189,7 @@ public struct RemoteState: Codable, Equatable, Sendable {
         self.blockers = blockers
         self.history = history
         self.t3Sleep = t3Sleep
+        self.sleepIntentActive = sleepIntentActive
     }
 }
 
@@ -197,7 +201,8 @@ public struct RemoteRequest: Codable, Equatable, Sendable {
     public static let wakeRecoveryVersion = 4
     public static let sleepHistoryVersion = 5
     public static let t3SleepVersion = 6
-    public static let supportedVersions: Set<Int> = [1, 2, 3, 4, 5, 6]
+    public static let sleepIntentVersion = 7
+    public static let supportedVersions: Set<Int> = [1, 2, 3, 4, 5, 6, 7]
 
     public let version: Int
     public let requestID: String
@@ -283,7 +288,8 @@ public struct RemoteResponse: Codable, Equatable, Sendable {
     public static let wakeRecoveryVersion = 4
     public static let sleepHistoryVersion = 5
     public static let t3SleepVersion = 6
-    public static let supportedVersions: Set<Int> = [1, 2, 3, 4, 5, 6]
+    public static let sleepIntentVersion = 7
+    public static let supportedVersions: Set<Int> = [1, 2, 3, 4, 5, 6, 7]
 
     public let version: Int
     public let requestID: String
@@ -330,7 +336,8 @@ public struct RemoteResponse: Codable, Equatable, Sendable {
                         wakeTargetMACs: version >= 4 ? $0.wakeTargetMACs : nil,
                         blockers: version >= 5 ? $0.blockers : nil,
                         history: version >= 5 ? $0.history : nil,
-                        t3Sleep: version >= 6 ? $0.t3Sleep : nil)
+                        t3Sleep: version >= 6 ? $0.t3Sleep : nil,
+                        sleepIntentActive: version >= 7 ? $0.sleepIntentActive : nil)
         }
         let unsigned = Self(
             version: version,
@@ -400,6 +407,7 @@ public struct RemoteResponse: Codable, Equatable, Sendable {
             (version >= Self.wakeRecoveryVersion || state?.wakeTargetMACs == nil) &&
             (version >= Self.sleepHistoryVersion || (state?.blockers == nil && state?.history == nil)) &&
             (version >= Self.t3SleepVersion || state?.t3Sleep == nil) &&
+            (version >= Self.sleepIntentVersion || state?.sleepIntentActive == nil) &&
             RemoteAuthentication.isValid(
                 signature: signature,
                 payload: canonicalPayload,

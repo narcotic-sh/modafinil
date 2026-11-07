@@ -31,7 +31,19 @@ public struct SleepSchedule: Codable, Equatable {
 public struct SleepJournal: Codable, Equatable {
     public var schedule: SleepSchedule?
     public var attempt: SleepAttempt?
+    public var intent: SleepIntent?
+    public var observedPowerEvents: [PowerEvent]?
     public init() {}
+}
+
+/// A user's explicit sleep choice, scoped to this boot. Deadlines and the wake
+/// storm budget use continuous time, which includes time spent asleep.
+public struct SleepIntent: Codable, Equatable {
+    public var boot: TimeInterval
+    public var lastSleep: TimeInterval
+    public var lastWake: TimeInterval
+    public var returnAfter: TimeInterval?
+    public var returns: [TimeInterval] = []
 }
 
 public struct SystemSleepTimes {
@@ -106,13 +118,17 @@ public final class SleepCoordinator {
     private let requestSleep: () throws -> Void
     private let save: (SleepJournal) throws -> Void
     private let failureHint: () -> String?
-    public var hasWork: Bool { journal.schedule != nil || journal.attempt?.phase == .pending }
+    private let snapshot: () -> PowerSnapshot?
+    private let userIdle: () -> TimeInterval?
+    private var lastUserIdle: TimeInterval?
+    public var hasWork: Bool { journal.intent != nil || journal.schedule != nil || journal.attempt?.phase == .pending }
 
     /// How the helper should wake itself: never, once at the timer date, or every
-    /// second only during the short sleep-verification window.
-    public enum TimerMode: Equatable { case idle, deadline(Date), verifying }
+    /// second during verification or a bounded background-wake grace period.
+    public enum TimerMode: Equatable { case idle, deadline(Date), verifying, monitoring }
     public var timerMode: TimerMode {
-        if journal.attempt?.phase == .pending || isAwaitingFirstWake { return .verifying }
+        if journal.attempt?.phase == .pending || isAwaitingFirstWake || journal.intent?.returnAfter != nil { return .verifying }
+        if journal.intent != nil { return .monitoring }
         if let schedule = journal.schedule { return .deadline(schedule.date) }
         return .idle
     }
@@ -138,15 +154,22 @@ public final class SleepCoordinator {
                 disablePrevention: @escaping () throws -> Void,
                 requestSleep: @escaping () throws -> Void = NativeSleep.request,
                 save: @escaping (SleepJournal) throws -> Void = SleepJournalStore.write,
-                failureHint: @escaping () -> String? = { nil }) {
+                failureHint: @escaping () -> String? = { nil },
+                snapshot: @escaping () -> PowerSnapshot? = PowerSnapshot.read,
+                userIdle: @escaping () -> TimeInterval? = SystemUserActivity.idleSeconds) {
         self.journal = journal; self.now = now; self.continuous = continuous
         self.powerTimes = powerTimes; self.disablePrevention = disablePrevention
         self.requestSleep = requestSleep; self.save = save; self.failureHint = failureHint
+        self.snapshot = snapshot; self.userIdle = userIdle
     }
 
     public func restore() throws {
-        // Never resume a half-completed operation after a helper crash.
-        if let attempt = journal.attempt, attempt.phase == .pending {
+        if let intent = journal.intent, intent.boot != (try powerTimes()).boot {
+            journal.intent = nil
+        }
+        // Legacy one-shot requests stop after a crash. A durable sleep intent
+        // resumes its existing deadline and attempt budget on the same boot.
+        if let attempt = journal.attempt, attempt.phase == .pending, journal.intent == nil {
             let times = try powerTimes()
             if times.slept > attempt.baselineSleep {
                 journal.attempt?.phase = .confirmed
@@ -165,6 +188,7 @@ public final class SleepCoordinator {
     }
 
     public func stopAfterFailure(_ detail: String) {
+        journal.intent = nil
         journal.schedule = nil
         journal.attempt = SleepAttempt(id: UUID().uuidString, requestedAt: now(), baselineSleep: 0,
             deadline: continuous(), nextAttempt: continuous(), attempts: 0, phase: .failed, detail: detail)
@@ -188,7 +212,9 @@ public final class SleepCoordinator {
     }
 
     public func cancelPending() throws {
-        guard journal.attempt?.phase == .pending else { return }
+        journal.intent = nil
+        lastUserIdle = nil
+        guard journal.attempt?.phase == .pending else { try persist(); return }
         if let attempt = journal.attempt, let times = try? powerTimes(), times.slept > attempt.baselineSleep {
             journal.attempt?.phase = .confirmed
             journal.attempt?.sleptAt = Date(timeIntervalSince1970: times.slept)
@@ -201,16 +227,21 @@ public final class SleepCoordinator {
         try persist()
     }
 
-    public func begin(trigger: String = "request") throws {
+    public func begin(trigger: String = "request", maintainSleepIntent: Bool = false) throws {
         let times = try powerTimes()
         try disablePrevention()
         let time = continuous()
+        if maintainSleepIntent {
+            journal.intent = SleepIntent(boot: times.boot, lastSleep: times.slept, lastWake: times.woke)
+            lastUserIdle = userIdle()
+        }
         journal.schedule = nil
         journal.attempt = SleepAttempt(id: UUID().uuidString, requestedAt: now(), baselineSleep: times.slept,
-            deadline: time + 32, nextAttempt: time + 2, attempts: 0, phase: .pending,
+            deadline: time + 120, nextAttempt: time + 2, attempts: 0, phase: .pending,
             detail: "Sleep requested. Waiting for macOS to enter sleep.", trigger: trigger)
         do { try persist() } // Durable receipt before acknowledging or issuing a power request.
         catch {
+            journal.intent = nil
             journal.attempt?.phase = .failed
             journal.attempt?.detail = "The sleep receipt could not be saved. No power request was sent."
             throw error
@@ -221,6 +252,13 @@ public final class SleepCoordinator {
         do {
             let time = continuous()
             let times = try powerTimes()
+            if let intent = journal.intent, times.woke <= intent.lastWake, let idle = userIdle() {
+                if let previous = lastUserIdle, idle + 0.5 < previous {
+                    try cancelPending()
+                    return
+                }
+                lastUserIdle = idle
+            }
             if let schedule = journal.schedule, now() >= schedule.date || time >= schedule.continuousDeadline {
                 // Never put a just-awakened Mac back to sleep for an elapsed timer.
                 if times.slept > 0, times.slept <= schedule.date.timeIntervalSince1970,
@@ -239,7 +277,7 @@ public final class SleepCoordinator {
                         baselineSleep: times.slept, deadline: time, nextAttempt: time, attempts: 0,
                         phase: .failed, detail: "The sleep timer was missed by more than a minute. Request sleep again.")
                     try persist()
-                } else { try begin(trigger: "timer") }
+                } else { try begin(trigger: "timer", maintainSleepIntent: true) }
             }
             guard var attempt = journal.attempt else { return }
             if attempt.phase == .pending {
@@ -247,12 +285,12 @@ public final class SleepCoordinator {
                     attempt.phase = .confirmed
                     attempt.sleptAt = Date(timeIntervalSince1970: times.slept)
                     attempt.detail = "macOS recorded a system sleep."
-                } else if abs(now().timeIntervalSince(attempt.requestedAt) - (time - (attempt.deadline - 32))) > 5 {
+                } else if abs(now().timeIntervalSince(attempt.requestedAt) - (time - (attempt.deadline - 120))) > 5 {
                     attempt.phase = .failed
                     attempt.detail = "The system clock changed during sleep verification. No further retries will run."
                 } else if time >= attempt.deadline {
                     attempt.phase = .failed
-                    attempt.detail = "macOS did not enter sleep within 30 seconds of the first attempt. No further retries will run. Background activity or macOS may be delaying sleep."
+                    attempt.detail = "macOS did not enter sleep within two minutes. No further retries will run. Background activity or macOS may be delaying sleep."
                     if let hint = failureHint() { attempt.detail += " " + hint }
                 } else if time >= attempt.nextAttempt, attempt.attempts < 3 {
                     attempt.attempts += 1
@@ -278,7 +316,10 @@ public final class SleepCoordinator {
                 }
             }
             if journal.attempt != attempt { journal.attempt = attempt; try persist() }
+            if attempt.phase == .failed { journal.intent = nil; try persist() }
+            try maintainIntent(times: times, time: time)
         } catch {
+            journal.intent = nil
             if let schedule = journal.schedule {
                 journal.schedule = nil
                 journal.attempt = SleepAttempt(id: UUID().uuidString, requestedAt: schedule.date,
@@ -291,11 +332,80 @@ public final class SleepCoordinator {
                 journal.attempt?.detail = error.localizedDescription
                 try? persist()
             }
+            try? persist()
             NSLog("Modafinil sleep coordinator: %@", error.localizedDescription)
         }
     }
 
+    /// Called on real power notifications as well as verification ticks. Network
+    /// reachability and display wake alone never count as the user's wake command.
+    private func maintainIntent(times: SystemSleepTimes, time: TimeInterval) throws {
+        guard var intent = journal.intent else { return }
+        guard intent.boot == times.boot else { journal.intent = nil; try persist(); return }
+        let power = snapshot()
+        if times.slept > intent.lastSleep {
+            recordPowerEvent(PowerEvent(kind: .sleep, at: times.slept,
+                reason: power?.lastSleepReason, pid: power?.sleepRequestedByPID))
+            intent.lastSleep = times.slept
+            intent.returnAfter = nil
+            lastUserIdle = nil
+        }
+        if times.woke > intent.lastWake, times.woke >= times.slept {
+            intent.lastWake = times.woke
+            recordPowerEvent(PowerEvent(kind: .wake, at: times.woke,
+                reason: power?.combinedWakeReason, dark: power?.hasGraphics.map { !$0 }))
+            let cause = PowerReason.wakeCause(power?.combinedWakeReason)
+            if cause == .userInput || cause == .lid {
+                journal.intent = nil
+                try persist()
+                return
+            }
+            // Apple silicon can take ~50 s to finish a natural maintenance sleep.
+            // Let that transition settle before asking for another sleep.
+            // Permit the travelling phone to reconnect and authenticate, without
+            // turning on a sleep-prevention lease for incidental Ethernet traffic.
+            intent.returnAfter = time + 90
+            lastUserIdle = userIdle()
+        }
+        if intent.returnAfter != nil, let idle = userIdle() {
+            if let previous = lastUserIdle, idle + 0.5 < previous {
+                journal.intent = nil
+                lastUserIdle = nil
+                try persist()
+                return
+            }
+            lastUserIdle = idle
+        }
+        journal.intent = intent
+        if let deadline = intent.returnAfter, time >= deadline {
+            intent.returns = intent.returns.filter { time - $0 < 600 }
+            guard intent.returns.count < 3 else {
+                journal.intent = nil
+                journal.attempt?.phase = .failed
+                journal.attempt?.detail = "Sleep was recorded, but repeated background wakes prevented staying asleep (three returns in ten minutes). Automatic retries stopped. Check Sleep History and network clients."
+                try persist()
+                return
+            }
+            intent.returns.append(time)
+            intent.returnAfter = nil
+            journal.intent = intent
+            try begin(trigger: "sleep intent")
+        } else {
+            // No disk writes on unchanged verification ticks.
+            if intent != lastSavedIntent { try persist() }
+        }
+    }
+
+    private func recordPowerEvent(_ event: PowerEvent) {
+        var events = journal.observedPowerEvents ?? []
+        if !events.contains(where: { $0.kind == event.kind && $0.at == event.at }) { events.append(event) }
+        journal.observedPowerEvents = Array(events.suffix(512))
+    }
+
+    private var lastSavedIntent: SleepIntent?
+
     private func persist() throws {
         try save(journal)
+        lastSavedIntent = journal.intent
     }
 }

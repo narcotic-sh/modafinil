@@ -40,7 +40,7 @@ final class SleepCoordinatorTests: XCTestCase {
     }
     func testThreeAttemptsThenStopAndReportFailure() throws {
         let f = Fixture(); try f.engine.begin()
-        f.advance(2); f.advance(10); f.advance(10); f.advance(10)
+        f.advance(2); f.advance(10); f.advance(10); f.advance(98)
         XCTAssertEqual(f.requests, 3)
         XCTAssertEqual(f.engine.journal.attempt?.phase, .failed)
         XCTAssertFalse(f.engine.hasWork)

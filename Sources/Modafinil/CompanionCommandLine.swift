@@ -65,6 +65,13 @@ enum CompanionCommandLine {
                 return fail("Usage: --remote-mac status|wake|sleep|t3sleep-on|t3sleep-off <name or address>")
             }
             return runRemoteMacCommand(rest[0], target: rest[1])
+        case "--remote-mac-pairing-link":
+            guard rest.count == 1,
+                  let mac = try? RemoteMacStore().load().first(where: {
+                      $0.displayName.localizedCaseInsensitiveContains(rest[0]) || $0.macHost == rest[0]
+                  }) else { return fail("Usage: --remote-mac-pairing-link <paired name or address>") }
+            print(mac.pairingURL.absoluteString)
+            return 0
         case "--remote-mac-list":
             for mac in (try? RemoteMacStore().load()) ?? [] {
                 print("\(mac.displayName)\t\(mac.macHost):\(mac.macPort)\trelay \(mac.relayHost):\(mac.relayPort)\twake \(mac.targetMAC)")

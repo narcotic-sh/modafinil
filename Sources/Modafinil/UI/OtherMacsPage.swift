@@ -10,7 +10,7 @@ extension RemoteMacsController.Phase {
         case .checking: return "Checking…"
         case .awake: return "Awake · Keep-awake on"
         case .reachable: return "Awake · Sleeps normally"
-        case .sleepRequested: return "Going to sleep…"
+        case .sleepRequested: return "Sleep requested · confirmation pending"
         case .unreachable: return "Asleep or unreachable"
         case .working(let message): return message
         case .failed: return "Could not complete the request"
@@ -23,7 +23,7 @@ extension RemoteMacsController.Phase {
         case .checking: return "Checking…"
         case .awake: return "Kept awake"
         case .reachable: return "Awake"
-        case .sleepRequested: return "Sleeping…"
+        case .sleepRequested: return "Sleep requested"
         case .unreachable: return "Asleep"
         case .working(let message): return message
         case .failed: return "Error"

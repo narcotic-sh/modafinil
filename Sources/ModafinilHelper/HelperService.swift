@@ -25,6 +25,7 @@ final class HelperService: NSObject, NSXPCListenerDelegate {
         }, failureHint: { SleepBlockers.failureHint() })
     }()
     private let wakeScheduler = WakeScheduler()
+    private lazy var powerMonitor = SystemPowerMonitor(callbackQueue: stateQueue)
     private let ownershipMarkerURL = URL(
         fileURLWithPath: "/Library/Application Support/Modafinil/sleep-prevention.enabled"
     )
@@ -33,6 +34,12 @@ final class HelperService: NSObject, NSXPCListenerDelegate {
         super.init()
         listener.delegate = self
         performStartupCleanup()
+        powerMonitor.onDidWake = { [weak self] in
+            guard let self else { return }
+            self.sleepCoordinator.tick()
+            self.updateSleepTickTimer()
+        }
+        do { try powerMonitor.start() } catch { NSLog("ModafinilHelper power monitoring failed: %@", error.localizedDescription) }
         // A wall-clock timer would fire late after the clock is set back; re-arm it.
         NotificationCenter.default.addObserver(forName: .NSSystemClockDidChange, object: nil, queue: nil) { [weak self] _ in
             guard let self else { return }
@@ -121,7 +128,7 @@ final class HelperService: NSObject, NSXPCListenerDelegate {
     ) {
         stateQueue.async {
             do {
-                try self.sleepCoordinator.begin(trigger: "request")
+                try self.sleepCoordinator.begin(trigger: "request", maintainSleepIntent: true)
                 self.updateSleepTickTimer()
                 reply(true, nil)
             } catch { reply(false, error.localizedDescription) }
@@ -144,7 +151,7 @@ final class HelperService: NSObject, NSXPCListenerDelegate {
 
     /// Wakes the helper only when needed: once at the timer date (wall clock, so it
     /// also fires right after a wake if the date passed during sleep), and once per
-    /// second only during the 32-second sleep verification.
+    /// second only during sleep verification or a background-wake grace period.
     private func updateSleepTickTimer() {
         let mode = sleepCoordinator.timerMode
         if mode == sleepTimerMode, sleepTickTimer != nil { return }
@@ -159,6 +166,11 @@ final class HelperService: NSObject, NSXPCListenerDelegate {
         case .verifying:
             timer = DispatchSource.makeTimerSource(queue: stateQueue)
             timer.schedule(deadline: .now() + 1, repeating: 1, leeway: .milliseconds(100))
+        case .monitoring:
+            // Dispatch timers do not schedule a hardware wake. This runs only
+            // while the CPU is awake; some dark wakes omit IOKit notifications.
+            timer = DispatchSource.makeTimerSource(queue: stateQueue)
+            timer.schedule(deadline: .now() + 5, repeating: 5, leeway: .seconds(1))
         case .deadline(let scheduledDate):
             timer = DispatchSource.makeTimerSource(queue: stateQueue)
             let date = sleepCoordinator.timerDeadline(now: Date(), continuousNow: SystemSleepTimes.continuousTime)

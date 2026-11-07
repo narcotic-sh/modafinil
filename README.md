@@ -28,6 +28,46 @@ Opening Modafinil from Launchpad or Finder shows the same controls in a regular 
 
 The menu also includes "Sleep When T3 Threads Finish (Lid Closed)", described below, and an "Only While Codex Is Running" option. When enabled, Modafinil keeps sleep prevention requested but only applies it while a Codex app or `codex` command is running.
 
+## Sleep intent and quiet observers (Mac 0.12.1 / Companion 1.11)
+
+An explicit sleep saves a helper-owned intent to stay asleep. A network or
+maintenance wake gets a 90-second grace period for the phone to authenticate a
+Wake & Keep Awake command or for macOS to return naturally to sleep. If it stays
+awake, the helper requests sleep again. Local input/lid opening, a
+wake alarm, explicit keep-awake, quitting the app, or reboot cancels the intent.
+Three automatic returns within ten minutes stop the policy and report persistent
+interference rather than create an endless sleep/wake loop. Native requests are
+still capped at three; kernel sleep verification now allows two minutes for a
+slow transition. Per-request budgets and return deadlines survive helper restarts.
+
+Protocol v7 signs `sleepIntentActive`, which describes the policy, not the current
+physical power state. v1–v6 response payloads omit it and retain their signatures.
+The app does not start its old 90-second recovery lease while the intent is active.
+Remote display-wake assertions are released after 15 seconds and before sleep.
+
+Some Apple-silicon dark wakes omit IOKit wake notifications. A five-second dispatch
+timer samples only local kernel state while an intent is active; it does no work
+during system sleep and schedules no hardware wake. The helper retains up to
+512 observed sleep/wake events, which the app imports once into Sleep History.
+The 90-second settling window avoids racing the mini's roughly 50-second natural
+maintenance-sleep transition, observed in live testing. A dedicated regression
+test covers this delayed kernel update.
+
+Paired observing Macs receive signed power-intent pushes on tailnet UDP 48767.
+Only authenticated command peers are notified (up to 16); receivers require the
+paired sender's tailnet address and command key, a fresh timestamp and increasing
+revision. Three datagrams tolerate loss; delayed older notices cannot undo a newer
+one. These notices authorize no power command. Observers cache only policy metadata
+under `~/Library/Application Support/Modafinil/remote-power/<tailnet-IP>.json`.
+Automatic remote refreshes skip sleeping Macs, including after app restart.
+
+The user's MacBook mount agent watches that local directory and unmounts normally
+on sleep, then resumes mounting on wake. Busy shares are preserved. This integration
+is in `~/agent-config/tools/macmini-mount`; no SMB health probe runs on an existing
+mount. A missed notice can still leave a client mounted; sleep/wake history remains
+the authority for validation. `--remote-mac-pairing-link <paired name or address>`
+exports an existing pairing for private setup; its output contains secrets.
+
 ## Sleep timer and confirmed results
 
 Use **Sleep Timer** to choose 1–1440 minutes, update, or cancel. The privileged
@@ -37,18 +77,19 @@ Missed timers never put a just-awakened Mac back to sleep.
 
 The helper requests sleep through public `IOPMSleepSystem`, records a durable
 receipt, and checks kernel sleep/wake timestamps. Acceptance is not confirmation.
-At most three requests run over 32 seconds; any observed sleep ends retries,
-even if the Mac wakes immediately afterward. Native errors and missing sleep
+At most three native requests run per transition, with up to two minutes to
+observe kernel sleep. Any observed sleep ends retries for that transition; an
+active sleep intent handles later background wakes as described above. Native errors and missing sleep
 transitions are reported in both apps. Continuous time bounds the timer and
 verification window despite wall-clock changes. The journal is root-written
 at `/Library/Application Support/Modafinil/sleep-journal.json`; it contains only
 timer/result metadata, with no pairing keys, credentials, or screen contents.
 
-The iPhone clears expired countdowns, refreshes on foreground entry and performs
-one delayed result check. It labels an unreachable Mac as unverified. The Mac
-continues to permit network wake and macOS maintenance; this is not a guarantee
-of uninterrupted deep sleep. Companion 1.4 uses protocol v3; v1/v2 clients remain
-compatible but cannot display sleep receipts.
+Companion 1.11 clears expired countdowns locally and suppresses automatic contact
+after a saved sleep request, including foreground entry. An explicit refresh can
+wake the Mac and is labeled accordingly. Unreachable remains unverified. Network
+wake and macOS maintenance remain enabled; uninterrupted deep sleep is not promised.
+Older phones remain compatible but retain their original checking behavior.
 
 Validation on 2026-09-29 included 40 passing Swift tests, a signed release build,
 Mac timer save/cancel checks, and an approved live one-minute timer. macOS logged

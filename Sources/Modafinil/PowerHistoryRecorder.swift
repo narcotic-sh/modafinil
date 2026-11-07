@@ -73,6 +73,16 @@ final class PowerHistoryRecorder {
         return RemoteHistory.page(from: from, to: to, segments: segments, markers: markers)
     }
 
+    /// The privileged helper runs during dark wakes that may suspend the app.
+    /// Import its bounded kernel observations once, without duplicating UI records.
+    func importHelperEvents(_ observed: [PowerEvent]) {
+        let known = Set(events.map { "\($0.kind.rawValue)|\($0.at)" })
+        let fresh = observed.filter { !known.contains("\($0.kind.rawValue)|\($0.at)") }.sorted { $0.at < $1.at }
+        guard !fresh.isEmpty else { return }
+        append(fresh)
+        state = PowerRecorderState(events: events)
+    }
+
     private func append(_ newEvents: [PowerEvent]) {
         guard !newEvents.isEmpty else { return }
         events += newEvents

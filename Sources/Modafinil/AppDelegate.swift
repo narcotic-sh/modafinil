@@ -25,6 +25,8 @@ final class AppDelegate: NSObject,
     private let loginItems = LoginItemController()
     private let uiModel = AppUIModel()
     private let remoteMacs = RemoteMacsController()
+    private let powerNotices = RemotePowerNotices()
+    private var remoteWakeActivity: IOPMAssertionID = 0
     private var mainWindowController: MainWindowController?
     private var journalNotifyToken: Int32?
     private var assertionNotifyToken: Int32?
@@ -142,13 +144,15 @@ final class AppDelegate: NSObject,
         historyRecorder.recordAppStart()
         loginItems.applyDefaultIfNeeded()
         restoreScheduledWake()
+        powerNotices.onNotice = { [weak self] host, sleeping in self?.remoteMacs.receivedSleepIntent(host: host, sleeping: sleeping) }
+        powerNotices.start()
         startCompanionServer()
         refreshIcon()
         if !launchedAsLoginItem {
             showStatusWindow()
         }
 
-        if companionConfigurationStore.isWakeArmed {
+        if companionConfigurationStore.isWakeArmed && !hasSleepIntent {
             activateProvisionalWakeLease()
         }
         restoreKeepAwakeAfterT3SleepIfLidOpen()
@@ -182,6 +186,7 @@ final class AppDelegate: NSObject,
     func applicationWillTerminate(_ notification: Notification) {
         NotificationCenter.default.removeObserver(self)
         NSWorkspace.shared.notificationCenter.removeObserver(self)
+        releaseRemoteUserActivity()
         historyRecorder.recordAppStop()
         powerMonitor.stop()
         if let journalNotifyToken { notify_cancel(journalNotifyToken) }
@@ -209,6 +214,7 @@ final class AppDelegate: NSObject,
 
     private func startCompanionServer() {
         let server = CompanionServer(secret: companionConfigurationStore.secret)
+        server.authenticatedPeerHandler = { [weak self] host in self?.powerNotices.remember(host) }
         server.delegate = self
         server.errorHandler = { [weak self] message in
             self?.lastError = message
@@ -282,8 +288,10 @@ final class AppDelegate: NSObject,
         if status == UInt32(NOTIFY_STATUS_OK) { journalNotifyToken = token }
     }
 
+    private var hasSleepIntent: Bool { (try? SleepJournalStore.read())?.intent != nil }
+
     private func activateProvisionalWakeLease() {
-        guard companionConfigurationStore.isWakeArmed else { return }
+        guard companionConfigurationStore.isWakeArmed, !hasSleepIntent else { return }
         if !isProvisionalWakeLeaseActive {
             historyRecorder.note("Wake recovery: keeping the Mac awake for 90 s")
         }
@@ -996,9 +1004,11 @@ final class AppDelegate: NSObject,
     private func synchronizeSleepJournal() {
         do {
             let journal = try SleepJournalStore.read()
+            historyRecorder.importHelperEvents(journal.observedPowerEvents ?? [])
             sleepHistoryError = nil
             scheduledSleepDate = journal.schedule?.date
             sleepAttempt = journal.attempt
+            powerNotices.publish(sleeping: journal.intent != nil, secret: companionConfigurationStore.secret)
             if let attempt = sleepAttempt { noteSleepAttemptIfChanged(attempt) }
             armQuitBlockersTimer()
             if let attempt = sleepAttempt {
@@ -1115,7 +1125,7 @@ final class AppDelegate: NSObject,
                 }
                 // A desktop is a workstation: a remote wake should light its display,
                 // not leave it in a display-off background wake.
-                if !LidMonitor.hasBuiltInLid { Self.declareRemoteUserActivity() }
+                if !LidMonitor.hasBuiltInLid { self.declareRemoteUserActivity() }
                 completion(.success((
                     self.makeRemoteState(),
                     "Modafinil is keeping the Mac awake."
@@ -1180,6 +1190,7 @@ final class AppDelegate: NSObject,
         let previousRequestedState = isSleepPreventionRequested
         let previousProvisionalLease = isProvisionalWakeLeaseActive
 
+        releaseRemoteUserActivity()
         // The wait for new T3 activity belongs to the wake that just ended.
         t3SleepWatch.clearWaitForNewActivity()
         // The helper retries for about 30 s, which gives the apps time to quit.
@@ -1240,16 +1251,28 @@ final class AppDelegate: NSObject,
                                    detail: $0.details.first.map { String($0.prefix(60)) })
             },
             history: history,
-            t3Sleep: history != nil ? nil : makeRemoteT3Sleep()
+            t3Sleep: history != nil ? nil : makeRemoteT3Sleep(),
+            sleepIntentActive: hasSleepIntent
         )
     }
 
-    private static func declareRemoteUserActivity() {
+    private func releaseRemoteUserActivity() {
+        if remoteWakeActivity != 0 { IOPMAssertionRelease(remoteWakeActivity); remoteWakeActivity = 0 }
+    }
+
+    private func declareRemoteUserActivity() {
+        releaseRemoteUserActivity()
         var assertionID = IOPMAssertionID(0)
         let result = IOPMAssertionDeclareUserActivity("Modafinil remote wake" as CFString,
                                                       kIOPMUserActiveLocal, &assertionID)
         if result != kIOReturnSuccess {
             NSLog("Modafinil could not wake the display: 0x%x", result)
+        } else {
+            remoteWakeActivity = assertionID
+            DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
+                guard self?.remoteWakeActivity == assertionID else { return }
+                self?.releaseRemoteUserActivity()
+            }
         }
     }
 

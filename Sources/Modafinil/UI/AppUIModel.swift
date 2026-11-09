@@ -1,5 +1,6 @@
 import Foundation
 import ModafinilShared
+import ModafinilRemoteProtocol
 import SwiftUI
 
 enum AppSection: String, CaseIterable, Identifiable, Hashable {
@@ -59,6 +60,12 @@ struct AppSnapshot {
     var helperStatus = ""
     var isHelperEnabled = false
     var scheduledSleepDate: Date?
+    /// The timer above shuts the Mac down instead of sleeping (0.13.0).
+    var isShutdownScheduled = false
+    var shutdownProgress: RemoteShutdown?
+    var t3PowerAction: RemotePowerAction = .sleep
+    /// Command-line jobs such as `caffeinate` that an automatic shutdown waits for.
+    var keepAwakeJobs: [String] = []
     var scheduledWakeDate: Date?
     var canScheduleSleep = false
     var canScheduleWake = false
@@ -97,6 +104,8 @@ protocol AppUIActions: AnyObject {
     func uiToggleLoginItem()
     func uiScheduleSleep(after seconds: Int)
     func uiCancelSleepTimer()
+    func uiScheduleShutdown(after seconds: Int)
+    func uiSetT3PowerAction(_ action: RemotePowerAction)
     func uiScheduleWake(at date: Date)
     func uiCancelWake()
     func uiOpenCompanionSetup()
@@ -148,6 +157,9 @@ enum T3SleepWording {
 }
 
 enum UIFormat {
+    /// Shown before every shutdown: what it means for a Mac controlled from far away.
+    static let shutdownWarning = "The Mac turns off completely. Wake-on-LAN, the iPad relay and wake alarms cannot start it again; someone has to press its power button. Apps are asked to quit; unsaved work may be lost."
+
     static func duration(_ seconds: Double) -> String {
         let total = Int(seconds.rounded())
         if total < 60 { return "\(total) s" }

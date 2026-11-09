@@ -29,4 +29,9 @@ public protocol ModafinilHelperProtocol {
     func sleepAfterDisablingSleepPrevention(
         withReply reply: @escaping (Bool, String?) -> Void
     )
+
+    /// Cancels any sleep timer or pending sleep, then runs `shutdown -h now`. The app
+    /// asks the user's apps to quit first; macOS ends whatever is still running.
+    @objc(shutDownNowWithReply:)
+    func shutDownNow(withReply reply: @escaping (Bool, String?) -> Void)
 }

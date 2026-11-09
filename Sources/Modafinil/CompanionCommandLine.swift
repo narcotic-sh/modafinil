@@ -1,4 +1,6 @@
+import AppKit
 import Foundation
+import ModafinilShared
 import ModafinilRemoteProtocol
 import ModafinilT3
 
@@ -10,6 +12,8 @@ import ModafinilT3
 ///     Modafinil --remote-mac-add < pairing-link.txt # control another Mac from this one
 ///     Modafinil --remote-mac-list
 ///     Modafinil --remote-mac status|wake|sleep|t3sleep-on|t3sleep-off <name or address>
+///     Modafinil --remote-mac t3action-sleep|t3action-shutdown <name or address>
+///     Modafinil --remote-mac shutdown <name or address> --yes   # off until its power button
 ///     Modafinil --t3-activity                       # what "Sleep when T3 finishes" counts here
 ///     Modafinil --install-helper                    # register the helper; approve it in Login Items
 ///
@@ -61,8 +65,15 @@ enum CompanionCommandLine {
             print("Added \(configuration.displayName) (\(configuration.macHost)).")
             return 0
         case "--remote-mac":
-            guard rest.count == 2, ["status", "wake", "sleep", "t3sleep-on", "t3sleep-off"].contains(rest[0]) else {
-                return fail("Usage: --remote-mac status|wake|sleep|t3sleep-on|t3sleep-off <name or address>")
+            if rest.first == "shutdown" {
+                guard rest.count == 3, rest[2] == "--yes" else {
+                    return fail("Usage: --remote-mac shutdown <name or address> --yes\nThe Mac stays off until someone presses its power button.")
+                }
+                return runRemoteMacCommand("shutdown", target: rest[1])
+            }
+            guard rest.count == 2, ["status", "wake", "sleep", "t3sleep-on", "t3sleep-off",
+                                    "t3action-sleep", "t3action-shutdown"].contains(rest[0]) else {
+                return fail("Usage: --remote-mac status|wake|sleep|t3sleep-on|t3sleep-off|t3action-sleep|t3action-shutdown <name or address>, or shutdown <name or address> --yes")
             }
             return runRemoteMacCommand(rest[0], target: rest[1])
         case "--remote-mac-pairing-link":
@@ -85,6 +96,10 @@ enum CompanionCommandLine {
             }
             if let idle = LidMonitor.userIdleSeconds() { print("Keyboard/mouse idle: \(Int(idle)) s") }
             print(LidMonitor.hasBuiltInLid ? "Rule: lid closed, no external display" : "Rule: nobody used the Mac for 5 min")
+            let jobs = KeepAwakeJobs.find(assertions: SleepBlockers.readAssertions(),
+                isRegularApp: { NSRunningApplication(processIdentifier: $0)?.activationPolicy == .regular })
+            print(jobs.isEmpty ? "Keep-awake jobs: none (a T3 shutdown would not wait)"
+                               : "Keep-awake jobs a T3 shutdown waits for: " + jobs.map(\.title).joined(separator: ", "))
             return 0
         case "--install-helper":
             let installer = PrivilegedHelperInstaller()
@@ -121,19 +136,23 @@ enum CompanionCommandLine {
             case "wake": await controller.wakeAndKeepAwake(mac.id)
             case "sleep": await controller.sleepNow(mac.id)
             case "t3sleep-on", "t3sleep-off": await controller.setT3Sleep(mac.id, enabled: action == "t3sleep-on")
+            case "t3action-sleep": await controller.setT3Action(mac.id, .sleep)
+            case "t3action-shutdown": await controller.setT3Action(mac.id, .shutdown)
+            case "shutdown": await controller.shutDown(mac.id)
             default: await controller.refresh(mac.id)
             }
             let phase = controller.macs.first { $0.id == mac.id }?.phase ?? .unknown
             var line = "\(mac.name): \(phase.title) after \(String(format: "%.1f", Date().timeIntervalSince(started))) s"
             if case .failed(let message) = phase { line += " — \(message)" }
             if let t3 = controller.macs.first(where: { $0.id == mac.id })?.t3Sleep {
-                line += "\n  Sleep when T3 finishes: \(t3.enabled ? "on" : "off") — \(t3.summary)"
+                line += "\n  Sleep when T3 finishes: \(t3.enabled ? "on" : "off")\(t3.action == .shutdown ? " (shut down)" : "") — \(t3.summary)"
                 if let at = t3.sleepAt { line += " (sleeps at \(UIFormat.time(Date(timeIntervalSince1970: TimeInterval(at)))))" }
             }
             print(line)
             switch phase {
             case .failed: code = 1
             case .unreachable: code = action == "sleep" ? 0 : 3
+            case .off: code = action == "shutdown" ? 0 : 3
             default: code = 0
             }
             done.signal()

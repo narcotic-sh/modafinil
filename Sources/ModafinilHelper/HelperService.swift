@@ -135,6 +135,41 @@ final class HelperService: NSObject, NSXPCListenerDelegate {
         }
     }
 
+    fileprivate func shutDownNow(withReply reply: @escaping (Bool, String?) -> Void) {
+        stateQueue.async {
+            // A sleep request racing the shutdown would leave a sleeping, not an off, Mac.
+            try? self.sleepCoordinator.cancelSchedule()
+            try? self.sleepCoordinator.cancelPending()
+            self.updateSleepTickTimer()
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/sbin/shutdown")
+            process.arguments = ["-h", "now", "Modafinil: shutdown requested"]
+            let errors = Pipe()
+            process.standardError = errors
+            process.standardOutput = FileHandle.nullDevice
+            let exited = DispatchSemaphore(value: 0)
+            process.terminationHandler = { _ in exited.signal() }
+            do { try process.run() } catch {
+                reply(false, "macOS did not start the shutdown: \(error.localizedDescription)")
+                return
+            }
+            // `shutdown` may never return once launchd starts stopping processes.
+            guard exited.wait(timeout: .now() + 3) == .success else {
+                NSLog("ModafinilHelper shutdown in progress")
+                reply(true, nil)
+                return
+            }
+            guard process.terminationStatus == 0 else {
+                let text = String(data: errors.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                reply(false, "macOS refused the shutdown (status \(process.terminationStatus))\(text.isEmpty ? "" : ": " + String(text.prefix(200))).")
+                return
+            }
+            NSLog("ModafinilHelper started a shutdown")
+            reply(true, nil)
+        }
+    }
+
     fileprivate func setSleepTimer(after seconds: Double, withReply reply: @escaping (Bool, String?) -> Void) {
         stateQueue.async {
             do {
@@ -330,6 +365,11 @@ private final class HelperSession: NSObject, ModafinilHelperProtocol {
 
     func requestTrackedSleep(withReply reply: @escaping (Bool, String?) -> Void) {
         sleepAfterDisablingSleepPrevention(withReply: reply)
+    }
+
+    func shutDownNow(withReply reply: @escaping (Bool, String?) -> Void) {
+        guard let service else { reply(false, "The helper service is unavailable."); return }
+        service.shutDownNow(withReply: reply)
     }
 
     func setSleepTimer(after seconds: Double, withReply reply: @escaping (Bool, String?) -> Void) {

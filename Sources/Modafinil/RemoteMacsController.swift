@@ -20,6 +20,8 @@ final class RemoteMacsController: ObservableObject {
         case unreachable
         case working(String)
         case failed(String)
+        /// Shut down from here, the iPhone or a timer. Stays off until its power button.
+        case off(Date)
 
         var isBusy: Bool {
             switch self {
@@ -37,6 +39,11 @@ final class RemoteMacsController: ObservableObject {
         var sleepAttempt: RemoteSleepAttempt?
         /// That Mac's "Sleep when T3 Code finishes" setting and T3 status (Mac 0.8.0+).
         var t3Sleep: RemoteT3Sleep?
+        /// Protocol version of its last answer; 8+ (Mac 0.13.0) can shut down.
+        var protocolVersion: Int?
+        var scheduledAction: RemotePowerAction?
+        var shutdown: RemoteShutdown?
+        var canShutDown: Bool { (protocolVersion ?? 0) >= RemoteRequest.shutdownVersion }
         var id: String { RemoteMacStore.identifier(configuration) }
         var name: String { configuration.displayName }
     }
@@ -58,6 +65,7 @@ final class RemoteMacsController: ObservableObject {
             macs = saved.map { configuration in
                 var mac = macs.first { $0.id == RemoteMacStore.identifier(configuration) } ?? Mac(configuration: configuration)
                 mac.configuration = configuration
+                if mac.phase == .unknown, let off = Self.shutDownAt(mac.id) { mac.phase = .off(off) }
                 return mac
             }
         } catch {
@@ -77,6 +85,7 @@ final class RemoteMacsController: ObservableObject {
 
     private func allowsAutomaticContact(_ mac: Mac) -> Bool {
         if mac.phase == .sleepRequested { return false }
+        if case .off = mac.phase { return false }
         let url = RemotePowerNotices.directory.appendingPathComponent(mac.configuration.macHost + ".json")
         if let data = try? Data(contentsOf: url),
            let value = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -91,6 +100,7 @@ final class RemoteMacsController: ObservableObject {
             values[mac.id] = sleeping ? Date().timeIntervalSince1970 : nil
             UserDefaults.standard.set(values, forKey: "remoteMacSleepQuietAfter")
             // A push changes policy, not our knowledge of the physical power state.
+            if case .off = mac.phase { continue }
             if sleeping, !mac.phase.isBusy { update(mac.id) { $0.phase = .sleepRequested } }
             if !sleeping, mac.phase == .sleepRequested { update(mac.id) { $0.phase = .unknown } }
         }
@@ -205,15 +215,40 @@ final class RemoteMacsController: ObservableObject {
                       working: enabled ? "Turning on sleep when T3 finishes…" : "Turning off sleep when T3 finishes…")
     }
 
+    /// Shuts that Mac down now. Sent only as protocol v8, never downgraded: an older
+    /// Mac does not know the command.
+    func shutDown(_ id: String) async {
+        await command(id, .shutdown, working: "Shutting down…", exactVersion: RemoteRequest.shutdownVersion)
+    }
+
+    func shutDown(_ id: String, after seconds: Int) async {
+        await command(id, .scheduleShutdown, argument: String(seconds), working: "Setting shutdown timer…",
+                      exactVersion: RemoteRequest.shutdownVersion)
+    }
+
+    func setT3Action(_ id: String, _ action: RemotePowerAction) async {
+        await command(id, .setT3Action, argument: action.rawValue,
+                      working: action == .shutdown ? "Shut down when T3 finishes…" : "Sleep when T3 finishes…",
+                      exactVersion: RemoteRequest.shutdownVersion)
+    }
+
     func cancelSleepTimer(_ id: String) async {
         await command(id, .cancelScheduledSleep, working: "Cancelling sleep timer…")
     }
 
-    private func command(_ id: String, _ command: RemoteCommand, argument: String = "", working: String) async {
+    private func command(_ id: String, _ command: RemoteCommand, argument: String = "", working: String,
+                         exactVersion: Int? = nil) async {
         guard let mac = mac(id), !mac.phase.isBusy else { return }
         let generation = begin(id, .working(working))
         do {
-            let response = try await send(mac.configuration, command, argument: argument)
+            let response: RemoteResponse
+            if let exactVersion {
+                response = try await RemoteMacClient(secret: mac.configuration.secret, protocolVersion: exactVersion)
+                    .send(command, argument: argument, host: mac.configuration.macHost,
+                          port: mac.configuration.macPort, timeout: 6)
+            } else {
+                response = try await send(mac.configuration, command, argument: argument)
+            }
             guard isCurrent(id, generation) else { return }
             apply(response, to: id)
         } catch {
@@ -228,7 +263,7 @@ final class RemoteMacsController: ObservableObject {
     private func send(_ configuration: PairingConfiguration, _ command: RemoteCommand,
                       argument: String = "", timeout: TimeInterval = 6) async throws -> RemoteResponse {
         var lastError: Error?
-        for version in [RemoteRequest.sleepIntentVersion, RemoteRequest.t3SleepVersion, RemoteRequest.sleepHistoryVersion, RemoteRequest.wakeRecoveryVersion] {
+        for version in [RemoteRequest.shutdownVersion, RemoteRequest.sleepIntentVersion, RemoteRequest.t3SleepVersion, RemoteRequest.sleepHistoryVersion, RemoteRequest.wakeRecoveryVersion] {
             do {
                 return try await RemoteMacClient(secret: configuration.secret, protocolVersion: version)
                     .send(command, argument: argument, host: configuration.macHost,
@@ -262,7 +297,12 @@ final class RemoteMacsController: ObservableObject {
             mac.sleepAttempt = state.sleepAttempt
             mac.scheduledSleepAt = state.scheduledSleepAt.map { Date(timeIntervalSince1970: TimeInterval($0)) }
             mac.t3Sleep = state.t3Sleep
-            if state.sleepPreventionEffective { mac.phase = .awake }
+            mac.protocolVersion = response.version
+            mac.scheduledAction = state.scheduledAction
+            mac.shutdown = state.shutdown
+            Self.setShutDownAt(id, state.shutdown?.phase == .pending ? Date() : nil)
+            if state.shutdown?.phase == .pending { mac.phase = .off(Date()) }
+            else if state.sleepPreventionEffective { mac.phase = .awake }
             else if state.sleepIntentActive == true || state.sleepAttempt?.phase == .pending { mac.phase = .sleepRequested }
             else { mac.phase = .reachable }
         }
@@ -270,8 +310,20 @@ final class RemoteMacsController: ObservableObject {
 
     private func fail(_ id: String, _ error: Error) {
         update(id) {
+            if RemoteMacClient.indicatesUnavailableDevice(error), let off = Self.shutDownAt(id) { $0.phase = .off(off); return }
             $0.phase = RemoteMacClient.indicatesUnavailableDevice(error) ? .unreachable : .failed(error.localizedDescription)
         }
+    }
+
+    private static func shutDownAt(_ id: String) -> Date? {
+        (UserDefaults.standard.dictionary(forKey: "remoteMacShutDownAt")?[id] as? Double).map(Date.init(timeIntervalSince1970:))
+    }
+
+    private static func setShutDownAt(_ id: String, _ date: Date?) {
+        var values = UserDefaults.standard.dictionary(forKey: "remoteMacShutDownAt") ?? [:]
+        guard (values[id] == nil) != (date == nil) else { return }
+        values[id] = date?.timeIntervalSince1970
+        UserDefaults.standard.set(values, forKey: "remoteMacShutDownAt")
     }
 
     private func mac(_ id: String) -> Mac? { macs.first { $0.id == id } }

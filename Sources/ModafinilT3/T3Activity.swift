@@ -379,3 +379,29 @@ public struct T3SleepWatch {
         waitStartedAt = nil
     }
 }
+
+/// "Shut down when T3 Code finishes": a shutdown cannot be undone from the phone, so it
+/// needs T3 to have worked since the rule was armed (the app started, the action was
+/// chosen, the rule was turned on, or a remote wake). A Mac switched on again with the
+/// power button, or woken remotely, is never shut down just because T3 is idle.
+public struct T3ShutdownGate: Equatable {
+    public private(set) var armedAt: Date
+    public private(set) var sawWork = false
+
+    public init(armedAt: Date = Date()) { self.armedAt = armedAt }
+
+    public mutating func arm(at date: Date = Date()) {
+        armedAt = date
+        sawWork = false
+    }
+
+    /// T3 was seen working (or waiting) at a check after arming.
+    public mutating func noteBusy() { sawWork = true }
+
+    /// A run requested after arming counts even if it ended between two checks.
+    public mutating func noteLatestRun(requestedAt date: Date?) {
+        if let date, date > armedAt { sawWork = true }
+    }
+
+    public var allowsShutdown: Bool { sawWork }
+}

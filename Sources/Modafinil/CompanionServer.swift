@@ -273,6 +273,21 @@ final class CompanionServer {
             return
         }
 
+        // A shutdown cannot be undone remotely: only a client that knows protocol v8
+        // (and so shows what a shutdown means) may ask for one.
+        guard request.version >= request.command.requiredVersion else {
+            send(
+                requestID: request.requestID,
+                version: request.version,
+                ok: false,
+                state: nil,
+                message: "Update Modafinil Companion to use this command.",
+                secret: responseSecret,
+                on: connection
+            )
+            return
+        }
+
         guard let delegate else {
             send(
                 requestID: request.requestID,

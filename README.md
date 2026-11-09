@@ -28,6 +28,33 @@ Opening Modafinil from Launchpad or Finder shows the same controls in a regular 
 
 The menu also includes "Sleep When T3 Threads Finish (Lid Closed)", described below, and an "Only While Codex Is Running" option. When enabled, Modafinil keeps sleep prevention requested but only applies it while a Codex app or `codex` command is running.
 
+## Remote shutdown (Mac 0.13.0 / Companion 1.12)
+
+Modafinil can turn a Mac off completely, from the iPhone, from another Mac
+(**Other Macs → Shut Down**) or on its own:
+
+- **Shut Down Now** (iPhone, Other Macs, `Modafinil --remote-mac shutdown <name> --yes`).
+- **Shutdown timer**: the timer card's *Sleep / Shut Down* choice. One power-down timer
+  at a time; a shutdown timer replaces a sleep timer and the other way round. It belongs to
+  the current boot, is cancelled by quitting Modafinil, and never fires late: a Mac that
+  slept through the time stays on.
+- **When T3 Code finishes: Shut Down**: the T3 rule's *Then* choice. It shuts down only after
+  a T3 run has finished since the rule was armed (Modafinil started, the choice or the
+  switch changed, or a remote Wake & Keep Awake), so a Mac switched on again is never shut
+  down just because T3 is idle. It also waits while a command-line job keeps the Mac awake
+  on purpose (`caffeinate`, an `ffmpeg` render, a script outside an app); the T3 status
+  names it. `Modafinil --t3-activity` lists those jobs.
+
+A shutdown asks every app to quit like ⌘Q, waits up to 30 seconds, then the helper runs
+`shutdown -h now`, which ends whatever is still open (unsaved work there is lost). Before
+that, Macs that mount this one get the usual sleep notice and unmount. The Mac answers the
+phone first, so the phone shows the shutdown as started.
+
+**A shut-down Mac stays off until someone presses its power button.** Apple silicon Macs
+do not start from Wake-on-LAN, so neither the iPad relay nor wake alarms can turn it on.
+Every shutdown control says so before it runs. Commands need protocol v8, which older
+phones and Macs do not send, so an older Companion can never shut a Mac down.
+
 ## Sleep intent and quiet observers (Mac 0.12.1 / Companion 1.11)
 
 An explicit sleep saves a helper-owned intent to stay asleep. A network or

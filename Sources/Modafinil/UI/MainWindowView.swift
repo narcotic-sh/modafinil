@@ -1,5 +1,6 @@
 import ModafinilShared
 import SwiftUI
+import ModafinilRemoteProtocol
 
 struct MainWindowView: View {
     @EnvironmentObject private var model: AppUIModel
@@ -103,7 +104,8 @@ struct OverviewPage: View {
                 }
             }
 
-            T3SleepCard(snapshot: snapshot) { model.actions?.uiToggleT3Sleep() }
+            T3SleepCard(snapshot: snapshot, toggle: { model.actions?.uiToggleT3Sleep() },
+                        setAction: { model.actions?.uiSetT3PowerAction($0) })
 
             BlockersCard(blockers: snapshot.blockers, quitsBeforeSleep: snapshot.isQuitBlockersEnabled)
         }
@@ -113,6 +115,8 @@ struct OverviewPage: View {
 struct T3SleepCard: View {
     let snapshot: AppSnapshot
     let toggle: () -> Void
+    let setAction: (RemotePowerAction) -> Void
+    @State private var confirmsShutdown = false
 
     var body: some View {
         Card(title: "Sleep when T3 Code finishes", symbol: "moon.stars.fill") {
@@ -121,13 +125,30 @@ struct T3SleepCard: View {
             }
             .toggleStyle(.switch)
             .accessibilityIdentifier("overviewT3Sleep")
+            if snapshot.isT3SleepEnabled {
+                Picker("Then", selection: Binding(get: { snapshot.t3PowerAction }, set: { action in
+                    if action == .shutdown { confirmsShutdown = true } else { setAction(action) }
+                })) {
+                    Text("Sleep").tag(RemotePowerAction.sleep)
+                    Text("Shut Down").tag(RemotePowerAction.shutdown)
+                }
+                .pickerStyle(.segmented)
+                .fixedSize()
+                .accessibilityIdentifier("t3PowerAction")
+                .confirmationDialog("Shut down when T3 Code finishes?", isPresented: $confirmsShutdown) {
+                    Button("Shut Down When Finished", role: .destructive) { setAction(.shutdown) }
+                } message: {
+                    Text(UIFormat.shutdownWarning + " It shuts down only after a T3 run finishes, never right after it is turned on or woken, and waits for command-line jobs such as caffeinate.")
+                }
+            }
             if !snapshot.isT3SleepEnabled {
                 Text(T3SleepWording.off)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             } else if let sleepAt = snapshot.t3SleepAt, sleepAt > Date() {
                 HStack(spacing: 6) {
-                    Text("T3 Code has finished. Sleeping in")
+                    Text(snapshot.t3PowerAction == .shutdown ? "T3 Code has finished. Shutting down in"
+                                                             : "T3 Code has finished. Sleeping in")
                     Text(timerInterval: Date()...sleepAt, countsDown: true).monospacedDigit()
                 }
                 .font(.headline)
@@ -265,6 +286,8 @@ struct TimersPage: View {
     @EnvironmentObject private var model: AppUIModel
     @State private var customMinutes = 30
     @State private var wakeDate = Date().addingTimeInterval(3600)
+    @State private var timerAction: RemotePowerAction = .sleep
+    @State private var pendingShutdownSeconds: Int?
 
     private static let presets: [(String, Int)] = [("15 min", 15), ("30 min", 30), ("1 h", 60), ("2 h", 120), ("4 h", 240)]
 
@@ -279,6 +302,16 @@ struct TimersPage: View {
                 wakeCard(snapshot)
             }
         }
+        .confirmationDialog("Shut down this Mac when the timer ends?",
+                            isPresented: Binding(get: { pendingShutdownSeconds != nil },
+                                                 set: { if !$0 { pendingShutdownSeconds = nil } })) {
+            Button("Start Shutdown Timer", role: .destructive) {
+                if let seconds = pendingShutdownSeconds { model.actions?.uiScheduleShutdown(after: seconds) }
+                pendingShutdownSeconds = nil
+            }
+        } message: {
+            Text(UIFormat.shutdownWarning + (snapshot.scheduledWakeDate != nil ? " The wake alarm cannot start a Mac that is shut down." : ""))
+        }
         .onAppear {
             if let date = snapshot.scheduledWakeDate { wakeDate = date }
         }
@@ -286,23 +319,38 @@ struct TimersPage: View {
 
     private func sleepCard(_ snapshot: AppSnapshot) -> some View {
         Card(title: "Sleep Timer", symbol: "moon.zzz.fill") {
+            if let progress = snapshot.shutdownProgress {
+                Text(progress.phase == .pending ? "Shutting down…" : "Shutdown failed")
+                    .font(.headline).foregroundStyle(progress.phase == .pending ? Color.primary : Color.red)
+                Text(progress.detail).font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             if let date = snapshot.scheduledSleepDate, date > Date() {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(timerInterval: Date()...date, countsDown: true)
                         .font(.system(size: 40, weight: .semibold, design: .rounded))
                         .monospacedDigit()
                         .foregroundStyle(.indigo)
-                    Text("The Mac sleeps at \(UIFormat.time(date)).")
+                    Text(snapshot.isShutdownScheduled ? "The Mac shuts down at \(UIFormat.time(date))."
+                                                      : "The Mac sleeps at \(UIFormat.time(date)).")
                         .foregroundStyle(.secondary)
                 }
                 Button("Cancel Timer", role: .destructive) { model.actions?.uiCancelSleepTimer() }
                     .accessibilityIdentifier("cancelSleepTimer")
             } else {
-                Text("Turn keep-awake off and put the Mac to sleep after:")
+                Picker("When the timer ends", selection: $timerAction) {
+                    Text("Sleep").tag(RemotePowerAction.sleep)
+                    Text("Shut Down").tag(RemotePowerAction.shutdown)
+                }
+                .pickerStyle(.segmented)
+                .fixedSize()
+                .accessibilityIdentifier("timerPowerAction")
+                Text(timerAction == .shutdown ? "Quit all apps and shut the Mac down after:"
+                                              : "Turn keep-awake off and put the Mac to sleep after:")
                     .foregroundStyle(.secondary)
                 HStack(spacing: 8) {
                     ForEach(Self.presets, id: \.1) { title, minutes in
-                        Button(title) { model.actions?.uiScheduleSleep(after: minutes * 60) }
+                        Button(title) { start(minutes * 60) }
                             .disabled(!snapshot.canScheduleSleep)
                     }
                 }
@@ -316,7 +364,7 @@ struct TimersPage: View {
                             Text("minutes")
                         }
                     }
-                    Button("Start") { model.actions?.uiScheduleSleep(after: min(1440, max(1, customMinutes)) * 60) }
+                    Button("Start") { start(min(1440, max(1, customMinutes)) * 60) }
                         .buttonStyle(.borderedProminent)
                         .tint(.indigo)
                         .disabled(!snapshot.canScheduleSleep)
@@ -335,13 +383,18 @@ struct TimersPage: View {
                     }
                 }
             }
-            Text("The helper keeps the timer even if this window closes. Quitting Modafinil cancels it.")
+            Text("The timer keeps running when this window closes. Quitting Modafinil cancels it.")
                 .font(.caption).foregroundStyle(.secondary)
             if snapshot.isQuitBlockersEnabled {
                 Text("1 minute before the timer ends, apps keeping the Mac awake are asked to quit.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
+    }
+
+    private func start(_ seconds: Int) {
+        if timerAction == .shutdown { pendingShutdownSeconds = seconds }
+        else { model.actions?.uiScheduleSleep(after: seconds) }
     }
 
     private func wakeCard(_ snapshot: AppSnapshot) -> some View {

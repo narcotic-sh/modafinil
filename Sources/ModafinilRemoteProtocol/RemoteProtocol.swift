@@ -15,6 +15,47 @@ public enum RemoteCommand: String, Codable, Sendable {
     case history
     /// Protocol v6: argument "1" turns "Sleep when T3 Code threads finish" on, "0" off.
     case setT3Sleep
+    /// Protocol v8: shut the Mac down now. Argument "". It stays off until someone
+    /// presses its power button; Wake-on-LAN and wake alarms cannot start it.
+    case shutdown
+    /// Protocol v8: shut down after this many seconds (60 to 86 400). Replaces a sleep
+    /// timer; `cancelScheduledSleep` cancels either kind.
+    case scheduleShutdown
+    /// Protocol v8: what "Sleep when T3 Code threads finish" does, `RemotePowerAction`.
+    case setT3Action
+
+    /// Commands a request older than protocol v8 may not carry.
+    public var requiredVersion: Int {
+        switch self {
+        case .shutdown, .scheduleShutdown, .setT3Action: return RemoteRequest.shutdownVersion
+        default: return RemoteRequest.currentVersion
+        }
+    }
+}
+
+/// What a timer or the T3 rule does when it fires (protocol v8).
+public enum RemotePowerAction: String, Codable, Sendable {
+    case sleep
+    case shutdown
+}
+
+/// A shutdown in progress, or the last one that failed (protocol v8).
+public struct RemoteShutdown: Codable, Equatable, Sendable {
+    public enum Phase: String, Codable, Sendable {
+        /// Apps are quitting; macOS shuts down within about a minute.
+        case pending
+        /// The shutdown did not start; the Mac stays on. `detail` says why.
+        case failed
+    }
+    public let requestedAt: Int64
+    public let phase: Phase
+    /// "iPhone", "Mac", "timer", "T3 Code finished" or another Mac's name.
+    public let trigger: String
+    public let detail: String
+
+    public init(requestedAt: Int64, phase: Phase, trigger: String, detail: String) {
+        self.requestedAt = requestedAt; self.phase = phase; self.trigger = trigger; self.detail = detail
+    }
 }
 
 /// The Mac's "Sleep when T3 Code threads finish (lid closed)" setting and what T3 is doing.
@@ -28,11 +69,21 @@ public struct RemoteT3Sleep: Codable, Equatable, Sendable {
     public let sleepAt: Int64?
     /// The Mac slept after T3 finished; keep-awake returns when the lid opens.
     public let restorePending: Bool
+    /// Protocol v8: `.shutdown` when the rule shuts the Mac down instead (then
+    /// `sleepAt` is the shutdown time). Nil means sleep.
+    public let action: RemotePowerAction?
 
     public init(enabled: Bool, summary: String, working: Int = 0, waiting: Int = 0,
-                sleepAt: Int64? = nil, restorePending: Bool = false) {
+                sleepAt: Int64? = nil, restorePending: Bool = false, action: RemotePowerAction? = nil) {
         self.enabled = enabled; self.summary = summary; self.working = working
         self.waiting = waiting; self.sleepAt = sleepAt; self.restorePending = restorePending
+        self.action = action
+    }
+
+    /// The same state without fields an older peer cannot verify.
+    func signable(version: Int) -> Self {
+        version >= RemoteRequest.shutdownVersion ? self : Self(enabled: enabled, summary: summary,
+            working: working, waiting: waiting, sleepAt: sleepAt, restorePending: restorePending)
     }
 
     public static func parseArgument(_ argument: String) -> Bool? {
@@ -165,6 +216,10 @@ public struct RemoteState: Codable, Equatable, Sendable {
     public let t3Sleep: RemoteT3Sleep?
     /// Protocol v7: a sleep choice, not proof that the CPU is asleep now.
     public let sleepIntentActive: Bool?
+    /// Protocol v8: `.shutdown` when `scheduledSleepAt` is a shutdown timer. Nil means sleep.
+    public let scheduledAction: RemotePowerAction?
+    /// Protocol v8: a shutdown in progress, or the last failed one.
+    public let shutdown: RemoteShutdown?
 
     public init(
         awakeRequested: Bool,
@@ -177,7 +232,9 @@ public struct RemoteState: Codable, Equatable, Sendable {
         blockers: [RemoteSleepBlocker]? = nil,
         history: RemoteHistory? = nil,
         t3Sleep: RemoteT3Sleep? = nil,
-        sleepIntentActive: Bool? = nil
+        sleepIntentActive: Bool? = nil,
+        scheduledAction: RemotePowerAction? = nil,
+        shutdown: RemoteShutdown? = nil
     ) {
         self.awakeRequested = awakeRequested
         self.sleepPreventionEffective = sleepPreventionEffective
@@ -190,6 +247,8 @@ public struct RemoteState: Codable, Equatable, Sendable {
         self.history = history
         self.t3Sleep = t3Sleep
         self.sleepIntentActive = sleepIntentActive
+        self.scheduledAction = scheduledAction
+        self.shutdown = shutdown
     }
 }
 
@@ -202,7 +261,8 @@ public struct RemoteRequest: Codable, Equatable, Sendable {
     public static let sleepHistoryVersion = 5
     public static let t3SleepVersion = 6
     public static let sleepIntentVersion = 7
-    public static let supportedVersions: Set<Int> = [1, 2, 3, 4, 5, 6, 7]
+    public static let shutdownVersion = 8
+    public static let supportedVersions: Set<Int> = [1, 2, 3, 4, 5, 6, 7, 8]
 
     public let version: Int
     public let requestID: String
@@ -289,7 +349,8 @@ public struct RemoteResponse: Codable, Equatable, Sendable {
     public static let sleepHistoryVersion = 5
     public static let t3SleepVersion = 6
     public static let sleepIntentVersion = 7
-    public static let supportedVersions: Set<Int> = [1, 2, 3, 4, 5, 6, 7]
+    public static let shutdownVersion = 8
+    public static let supportedVersions: Set<Int> = [1, 2, 3, 4, 5, 6, 7, 8]
 
     public let version: Int
     public let requestID: String
@@ -336,8 +397,10 @@ public struct RemoteResponse: Codable, Equatable, Sendable {
                         wakeTargetMACs: version >= 4 ? $0.wakeTargetMACs : nil,
                         blockers: version >= 5 ? $0.blockers : nil,
                         history: version >= 5 ? $0.history : nil,
-                        t3Sleep: version >= 6 ? $0.t3Sleep : nil,
-                        sleepIntentActive: version >= 7 ? $0.sleepIntentActive : nil)
+                        t3Sleep: version >= 6 ? $0.t3Sleep?.signable(version: version) : nil,
+                        sleepIntentActive: version >= 7 ? $0.sleepIntentActive : nil,
+                        scheduledAction: version >= 8 ? $0.scheduledAction : nil,
+                        shutdown: version >= 8 ? $0.shutdown : nil)
         }
         let unsigned = Self(
             version: version,
@@ -408,6 +471,8 @@ public struct RemoteResponse: Codable, Equatable, Sendable {
             (version >= Self.sleepHistoryVersion || (state?.blockers == nil && state?.history == nil)) &&
             (version >= Self.t3SleepVersion || state?.t3Sleep == nil) &&
             (version >= Self.sleepIntentVersion || state?.sleepIntentActive == nil) &&
+            (version >= Self.shutdownVersion || (state?.scheduledAction == nil && state?.shutdown == nil
+                && state?.t3Sleep?.action == nil)) &&
             RemoteAuthentication.isValid(
                 signature: signature,
                 payload: canonicalPayload,

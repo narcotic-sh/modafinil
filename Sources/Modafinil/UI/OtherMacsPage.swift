@@ -14,6 +14,7 @@ extension RemoteMacsController.Phase {
         case .unreachable: return "Asleep or unreachable"
         case .working(let message): return message
         case .failed: return "Could not complete the request"
+        case .off(let date): return "Shut down at \(UIFormat.time(date)) · press its power button to turn it on"
         }
     }
 
@@ -27,6 +28,7 @@ extension RemoteMacsController.Phase {
         case .unreachable: return "Asleep"
         case .working(let message): return message
         case .failed: return "Error"
+        case .off: return "Off"
         }
     }
 
@@ -37,9 +39,11 @@ extension RemoteMacsController.Phase {
         case .sleepRequested, .unreachable: return .indigo
         case .checking, .working: return .blue
         case .failed: return .orange
-        case .unknown: return .secondary
+        case .unknown, .off: return .secondary
         }
     }
+
+    var isOff: Bool { if case .off = self { return true } else { return false } }
 
     var symbol: String {
         switch self {
@@ -49,6 +53,7 @@ extension RemoteMacsController.Phase {
         case .checking, .working: return "arrow.triangle.2.circlepath"
         case .failed: return "exclamationmark.triangle.fill"
         case .unknown: return "desktopcomputer"
+        case .off: return "power.circle"
         }
     }
 }
@@ -59,6 +64,9 @@ struct OtherMacsPage: View {
     @State private var addMessage: (text: String, isError: Bool)?
     @State private var pairingCodeFor: RemoteMacsController.Mac?
     @State private var sleepConfirmationFor: RemoteMacsController.Mac?
+    /// A shutdown waiting for confirmation: now (nil seconds) or after a timer.
+    @State private var shutdownConfirmation: (mac: RemoteMacsController.Mac, seconds: Int?)?
+    @State private var t3ShutdownConfirmationFor: RemoteMacsController.Mac?
 
     private static let presets: [(String, Int)] = [("15 minutes", 15), ("30 minutes", 30), ("1 hour", 60),
                                                     ("2 hours", 120), ("4 hours", 240), ("8 hours", 480)]
@@ -81,6 +89,7 @@ struct OtherMacsPage: View {
                     Text("• Wake sends Wake-on-LAN packets from this Mac when it is on the same home network, and asks the iPad relay at the same time, so it also works away from home.")
                     Text("• The other Mac turns keep-awake on once it answers. Sleep turns keep-awake off and puts it to sleep.")
                     Text("• “Sleep when T3 Code finishes” is that Mac’s own setting and counts only the T3 threads running on it. On a Mac mini it applies once nobody has used its keyboard or mouse for 5 minutes.")
+                    Text("• Shut Down turns the other Mac off completely. Nothing here or on the iPhone can turn it on again; press its power button. Needs Modafinil 0.13.0 there.")
                     Text("• Status is checked when this page or the menu bar card opens, never in the background.")
                 }
                 .font(.callout)
@@ -102,6 +111,36 @@ struct OtherMacsPage: View {
         } message: {
             Text("Keep-awake turns off and the Mac sleeps. Wake it again from here or from the iPhone.")
         }
+        .confirmationDialog(shutdownConfirmation.map { $0.seconds == nil ? "Shut down \($0.mac.name) now?"
+                                : "Shut down \($0.mac.name) in \(AppDelegate.durationText(Double($0.seconds!)))?" } ?? "Shut down?",
+                            isPresented: Binding(get: { shutdownConfirmation != nil },
+                                                 set: { if !$0 { shutdownConfirmation = nil } }),
+                            titleVisibility: .visible) {
+            Button(shutdownConfirmation?.seconds == nil ? "Shut Down" : "Start Shutdown Timer", role: .destructive) {
+                if let pending = shutdownConfirmation {
+                    Task {
+                        if let seconds = pending.seconds { await macs.shutDown(pending.mac.id, after: seconds) }
+                        else { await macs.shutDown(pending.mac.id) }
+                    }
+                }
+                shutdownConfirmation = nil
+            }
+            Button("Cancel", role: .cancel) { shutdownConfirmation = nil }
+        } message: {
+            Text(UIFormat.shutdownWarning)
+        }
+        .confirmationDialog("Shut down \(t3ShutdownConfirmationFor?.name ?? "the Mac") when T3 Code finishes?",
+                            isPresented: Binding(get: { t3ShutdownConfirmationFor != nil },
+                                                 set: { if !$0 { t3ShutdownConfirmationFor = nil } }),
+                            titleVisibility: .visible) {
+            Button("Shut Down When Finished", role: .destructive) {
+                if let id = t3ShutdownConfirmationFor?.id { Task { await macs.setT3Action(id, .shutdown) } }
+                t3ShutdownConfirmationFor = nil
+            }
+            Button("Cancel", role: .cancel) { t3ShutdownConfirmationFor = nil }
+        } message: {
+            Text(UIFormat.shutdownWarning + " It shuts down only after a T3 run finishes there, never right after it is turned on or woken.")
+        }
     }
 
     private func macCard(_ mac: RemoteMacsController.Mac) -> some View {
@@ -121,9 +160,13 @@ struct OtherMacsPage: View {
                         Text(message).font(.callout).foregroundStyle(.orange)
                             .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
                     }
+                    if let shutdown = mac.shutdown, shutdown.phase == .failed {
+                        Text(shutdown.detail).font(.caption).foregroundStyle(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                     if let date = mac.scheduledSleepAt, date > Date() {
                         HStack(spacing: 4) {
-                            Text("Sleeps in")
+                            Text(mac.scheduledAction == .shutdown ? "Shuts down in" : "Sleeps in")
                             Text(timerInterval: Date()...date, countsDown: true).monospacedDigit()
                         }
                         .font(.callout).foregroundStyle(.indigo)
@@ -136,10 +179,22 @@ struct OtherMacsPage: View {
                         .toggleStyle(.switch)
                         .disabled(mac.phase.isBusy || mac.phase == .unreachable)
                         .accessibilityIdentifier("otherMacT3Sleep-\(mac.name)")
+                        if t3.enabled, mac.canShutDown {
+                            Picker("Then", selection: Binding(get: { t3.action ?? .sleep }, set: { action in
+                                if action == .shutdown { t3ShutdownConfirmationFor = mac }
+                                else { Task { await macs.setT3Action(mac.id, .sleep) } }
+                            })) {
+                                Text("Sleep").tag(RemotePowerAction.sleep)
+                                Text("Shut Down").tag(RemotePowerAction.shutdown)
+                            }
+                            .pickerStyle(.segmented)
+                            .fixedSize()
+                            .disabled(mac.phase.isBusy || mac.phase == .unreachable || mac.phase.isOff)
+                        }
                         if t3.enabled {
                             if let sleepAt = t3.sleepAt.map({ Date(timeIntervalSince1970: TimeInterval($0)) }), sleepAt > Date() {
                                 HStack(spacing: 4) {
-                                    Text("T3 finished. Sleeping in")
+                                    Text(t3.action == .shutdown ? "T3 finished. Shutting down in" : "T3 finished. Sleeping in")
                                     Text(timerInterval: Date()...sleepAt, countsDown: true).monospacedDigit()
                                 }
                                 .font(.callout).foregroundStyle(.indigo)
@@ -171,18 +226,20 @@ struct OtherMacsPage: View {
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.green)
-                .disabled(mac.phase.isBusy)
+                .disabled(mac.phase.isBusy || mac.phase.isOff)
 
                 Button {
                     sleepConfirmationFor = mac
                 } label: {
                     Label("Sleep", systemImage: "moon.zzz.fill")
                 }
-                .disabled(mac.phase.isBusy || mac.phase == .unreachable)
+                .disabled(mac.phase.isBusy || mac.phase == .unreachable || mac.phase.isOff)
 
                 if let date = mac.scheduledSleepAt, date > Date() {
-                    Button("Cancel Sleep Timer") { Task { await macs.cancelSleepTimer(mac.id) } }
-                        .disabled(mac.phase.isBusy)
+                    Button(mac.scheduledAction == .shutdown ? "Cancel Shutdown Timer" : "Cancel Sleep Timer") {
+                        Task { await macs.cancelSleepTimer(mac.id) }
+                    }
+                    .disabled(mac.phase.isBusy)
                 } else {
                     Menu("Sleep After…") {
                         ForEach(Self.presets, id: \.1) { title, minutes in
@@ -190,7 +247,22 @@ struct OtherMacsPage: View {
                         }
                     }
                     .fixedSize()
-                    .disabled(mac.phase.isBusy || mac.phase == .unreachable)
+                    .disabled(mac.phase.isBusy || mac.phase == .unreachable || mac.phase.isOff)
+                }
+
+                if mac.canShutDown {
+                    Menu {
+                        Button("Shut Down Now…") { shutdownConfirmation = (mac, nil) }
+                        Divider()
+                        ForEach(Self.presets, id: \.1) { title, minutes in
+                            Button("In \(title)…") { shutdownConfirmation = (mac, minutes * 60) }
+                        }
+                    } label: {
+                        Label("Shut Down", systemImage: "power.circle")
+                    }
+                    .fixedSize()
+                    .disabled(mac.phase.isBusy || mac.phase == .unreachable || mac.phase.isOff)
+                    .accessibilityIdentifier("otherMacShutDown-\(mac.name)")
                 }
 
                 Spacer()
@@ -296,8 +368,9 @@ struct OtherMacsPopoverSection: View {
                         Button { Task { await macs.wakeAndKeepAwake(mac.id) } } label: {
                             Image(systemName: "power")
                         }
-                        .help("Wake \(mac.name) and keep it awake")
-                        .disabled(mac.phase.isBusy)
+                        .help(mac.phase.isOff ? "\(mac.name) is shut down; press its power button"
+                                              : "Wake \(mac.name) and keep it awake")
+                        .disabled(mac.phase.isBusy || mac.phase.isOff)
                         .accessibilityIdentifier("popoverWake-\(mac.name)")
                         Menu {
                             Button("Sleep Now") { Task { await macs.sleepNow(mac.id) } }
@@ -324,7 +397,7 @@ struct OtherMacsPopoverSection: View {
                         .menuIndicator(.hidden)
                         .fixedSize()
                         .help("Sleep \(mac.name) now or later")
-                        .disabled(mac.phase.isBusy || mac.phase == .unreachable)
+                        .disabled(mac.phase.isBusy || mac.phase == .unreachable || mac.phase.isOff)
                         .accessibilityIdentifier("popoverSleep-\(mac.name)")
                     }
                     .buttonStyle(.borderless)

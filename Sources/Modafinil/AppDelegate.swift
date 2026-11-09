@@ -82,6 +82,17 @@ final class AppDelegate: NSObject,
     private var quitBlockersActivity: NSObjectProtocol?
     /// Labels the next helper sleep receipt, which the helper records as a generic request.
     private var pendingSleepSource: (source: String, at: Date)?
+    /// Remote shutdown (0.13.0): a one-time timer, the shutdown in progress or the last
+    /// failed one, and what "Sleep when T3 Code finishes" does.
+    private var shutdownSchedule: ShutdownSchedule? = AppDelegate.loadShutdownSchedule()
+    private var shutdownTimer: Timer?
+    private var shutdownTimerActivity: NSObjectProtocol?
+    private var shutdownProgress: RemoteShutdown?
+    private var t3PowerAction = RemotePowerAction(
+        rawValue: UserDefaults.standard.string(forKey: AppDelegate.t3ActionDefaultsKey) ?? "") ?? .sleep
+    private var t3ShutdownGate = T3ShutdownGate()
+    /// Why the T3 rule has not shut down yet although T3 finished, shown in its status.
+    private var t3ShutdownHold: String?
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         if let event = NSAppleEventManager.shared().currentAppleEvent,
@@ -144,6 +155,7 @@ final class AppDelegate: NSObject,
         historyRecorder.recordAppStart()
         loginItems.applyDefaultIfNeeded()
         restoreScheduledWake()
+        restoreShutdownSchedule()
         powerNotices.onNotice = { [weak self] host, sleeping in self?.remoteMacs.receivedSleepIntent(host: host, sleeping: sleeping) }
         powerNotices.start()
         startCompanionServer()
@@ -259,6 +271,7 @@ final class AppDelegate: NSObject,
         companionServer?.ensureRunning()
         synchronizeSleepJournal()
         t3SleepWatch.reset()
+        checkShutdownTimer()
         defer {
             restoreKeepAwakeAfterT3SleepIfLidOpen()
             refreshIcon()
@@ -571,6 +584,11 @@ final class AppDelegate: NSObject,
                 return
             }
 
+            // Like the sleep timer, quitting cancels a shutdown timer; it never fires later.
+            if self.shutdownSchedule != nil {
+                self.setShutdownSchedule(nil)
+                self.historyRecorder.note("Shutdown timer cancelled (Modafinil quit)")
+            }
             self.isTerminatingAfterCleanup = true
             NSApp.terminate(nil)
         }
@@ -808,6 +826,21 @@ final class AppDelegate: NSObject,
 
     func uiCancelSleepTimer() { cancelScheduledSleep(source: "Mac") }
 
+    func uiScheduleShutdown(after seconds: Int) {
+        scheduleShutdown(argument: String(seconds), source: "Mac") { [weak self] result in
+            switch result {
+            case .success: self?.lastError = nil
+            case .failure(let error): self?.lastError = error.localizedDescription
+            }
+            self?.refreshIcon()
+        }
+    }
+
+    func uiSetT3PowerAction(_ action: RemotePowerAction) {
+        lastError = nil
+        setT3PowerAction(action, source: "Mac")
+    }
+
     func uiScheduleWake(at date: Date) {
         setScheduledWake(date, source: "Mac") { [weak self] result in
             if case .failure(let error) = result { self?.lastError = error.localizedDescription }
@@ -904,6 +937,10 @@ final class AppDelegate: NSObject,
         argument: String,
         completion: @escaping (Result<(RemoteState, String), Error>) -> Void
     ) {
+        if shutdownProgress?.phase == .pending, command != .status, command != .history {
+            completion(.failure(CompanionRemoteError("The Mac is shutting down.")))
+            return
+        }
         switch command {
         case .status:
             completion(.success((makeRemoteState(), "Status updated.")))
@@ -939,6 +976,27 @@ final class AppDelegate: NSObject,
             setScheduledWake(Date(timeIntervalSince1970: TimeInterval(timestamp)), source: "iPhone", completion: completion)
         case .cancelScheduledWake:
             setScheduledWake(nil, source: "iPhone", completion: completion)
+        case .shutdown:
+            guard argument.isEmpty else {
+                completion(.failure(CompanionRemoteError("The shutdown request is invalid.")))
+                return
+            }
+            beginShutdown(trigger: "iPhone") { [weak self] result in
+                guard let self else { return }
+                completion(result.map { (self.makeRemoteState(),
+                    "Shutting down. Apps are quitting; the Mac turns off within about a minute. Press its power button to turn it on again.") })
+            }
+        case .scheduleShutdown:
+            scheduleShutdown(argument: argument, source: "iPhone", completion: completion)
+        case .setT3Action:
+            guard let action = RemotePowerAction(rawValue: argument) else {
+                completion(.failure(CompanionRemoteError("The T3 action is invalid.")))
+                return
+            }
+            setT3PowerAction(action, source: "iPhone")
+            completion(.success((makeRemoteState(), action == .shutdown
+                ? "The Mac will shut down once T3 Code threads finish and \(T3SleepWording.condition)."
+                : "The Mac will sleep once T3 Code threads finish and \(T3SleepWording.condition).")))
         case .wake:
             completion(.failure(
                 CompanionRemoteError("Wake requests must be sent to the iPhone relay.")
@@ -976,6 +1034,7 @@ final class AppDelegate: NSObject,
             case .success:
                 self.companionConfigurationStore.isWakeArmed = true
                 self.isKeepAwakeSuspendedForT3Sleep = false
+                self.setShutdownSchedule(nil)
                 self.historyRecorder.note("Sleep timer set for \(Self.durationText(Double(seconds))) (\(source))")
                 completion(.success((self.makeRemoteState(), "Sleep timer saved on the Mac.")))
             case .failure(let error): completion(.failure(error))
@@ -984,6 +1043,10 @@ final class AppDelegate: NSObject,
     }
 
     private func cancelScheduledSleep(source: String, completion: ((Result<(RemoteState, String), Error>) -> Void)? = nil) {
+        if shutdownSchedule != nil {
+            setShutdownSchedule(nil)
+            historyRecorder.note("Shutdown timer cancelled (\(source))")
+        }
         helperClient.setSleepTimer(after: 0) { [weak self] result in
             guard let self else { return }
             self.synchronizeSleepJournal()
@@ -1008,7 +1071,8 @@ final class AppDelegate: NSObject,
             sleepHistoryError = nil
             scheduledSleepDate = journal.schedule?.date
             sleepAttempt = journal.attempt
-            powerNotices.publish(sleeping: journal.intent != nil, secret: companionConfigurationStore.secret)
+            powerNotices.publish(sleeping: journal.intent != nil || shutdownProgress?.phase == .pending,
+                                 secret: companionConfigurationStore.secret)
             if let attempt = sleepAttempt { noteSleepAttemptIfChanged(attempt) }
             armQuitBlockersTimer()
             if let attempt = sleepAttempt {
@@ -1118,6 +1182,8 @@ final class AppDelegate: NSObject,
                 // Only a closed-lid wake with the feature on needs the wait; a wait
                 // left over from an open-lid wake would block the rule later.
                 self.lastRemoteKeepAwakeAt = Date()
+                // Someone wants this Mac on: a shutdown needs a new T3 run first.
+                self.t3ShutdownGate.arm()
                 if self.isT3SleepEnabled, self.lidMonitor.isLidClosed() != false {
                     self.t3SleepWatch.waitForNewActivity()
                     self.t3SleepAt = nil
@@ -1236,7 +1302,7 @@ final class AppDelegate: NSObject,
             awakeRequested: isAwakeRequestedForStatus,
             sleepPreventionEffective: isSleepPreventionEnabled,
             serverName: Host.current().localizedName ?? "Mac",
-            scheduledSleepAt: scheduledSleepDate.map { Int64($0.timeIntervalSince1970) },
+            scheduledSleepAt: (shutdownSchedule?.date ?? scheduledSleepDate).map { Int64($0.timeIntervalSince1970) },
             scheduledWakeAt: scheduledWakeDate.map { Int64($0.timeIntervalSince1970) },
             sleepAttempt: sleepAttempt.map {
                 RemoteSleepAttempt(requestedAt: Int64($0.requestedAt.timeIntervalSince1970),
@@ -1252,7 +1318,9 @@ final class AppDelegate: NSObject,
             },
             history: history,
             t3Sleep: history != nil ? nil : makeRemoteT3Sleep(),
-            sleepIntentActive: hasSleepIntent
+            sleepIntentActive: hasSleepIntent,
+            scheduledAction: shutdownSchedule != nil ? .shutdown : nil,
+            shutdown: shutdownProgress
         )
     }
 
@@ -1285,18 +1353,29 @@ final class AppDelegate: NSObject,
             waiting = threads.filter(\.isWaiting).count
             working = threads.count - waiting
         }
+        return RemoteT3Sleep(enabled: true, summary: String(t3StatusLine(activity).prefix(120)),
+                             working: working, waiting: waiting,
+                             sleepAt: t3SleepAt.map { Int64($0.timeIntervalSince1970) },
+                             restorePending: isKeepAwakeSuspendedForT3Sleep,
+                             action: t3PowerAction == .shutdown ? .shutdown : nil)
+    }
+
+    /// One line for the phone and the Mac: T3's state plus what the rule waits for.
+    private func t3StatusLine(_ activity: T3Activity) -> String {
         var summary = activity.summary
-        if t3SleepWatch.waitsForNewActivity, activity.isFinished {
+        if t3PowerAction == .shutdown {
+            if let hold = t3ShutdownHold, activity.isFinished { summary += " · " + hold }
+            else if !t3ShutdownGate.allowsShutdown, activity.isFinished { summary += " · shuts down after the next T3 run" }
+            else if !LidMonitor.hasBuiltInLid { summary += " · shuts down once unused for 5 min" }
+            else { summary += " · shuts down when finished" }
+        } else if t3SleepWatch.waitsForNewActivity, activity.isFinished {
             summary += LidMonitor.hasBuiltInLid ? " · sleeps after the next T3 run"
                                                 : " · sleeps after the next T3 run (or in 30 min)"
         } else if !LidMonitor.hasBuiltInLid {
             // Phones and Macs show this line as is; it carries the desktop condition.
             summary += " · sleeps once unused for 5 min"
         }
-        return RemoteT3Sleep(enabled: true, summary: String(summary.prefix(120)),
-                             working: working, waiting: waiting,
-                             sleepAt: t3SleepAt.map { Int64($0.timeIntervalSince1970) },
-                             restorePending: isKeepAwakeSuspendedForT3Sleep)
+        return summary
     }
 
     private func setScheduledWake(
@@ -1530,6 +1609,218 @@ final class AppDelegate: NSObject,
         RunLoop.main.add(timer, forMode: .common)
     }
 
+    // MARK: Shut down (0.13.0)
+
+    /// Asks the user's apps to quit like ⌘Q, waits up to 30 s, then the helper runs
+    /// `shutdown -h now`, which ends whatever is still running. `completion` runs once
+    /// the shutdown has started (before apps quit), so a remote caller gets its answer.
+    private func beginShutdown(trigger: String, completion: @escaping (Result<Void, Error>) -> Void) {
+        guard shutdownProgress?.phase != .pending else {
+            completion(.failure(CompanionRemoteError("The Mac is already shutting down.")))
+            return
+        }
+        guard !isQuitInProgress else {
+            completion(.failure(CompanionRemoteError("Modafinil is quitting.")))
+            return
+        }
+        refreshHelperStatus()
+        guard helperStatus == .enabled else {
+            completion(.failure(CompanionRemoteError(
+                "The privileged helper is not enabled. Open Modafinil on the Mac to approve it.")))
+            return
+        }
+        let apps = NSWorkspace.shared.runningApplications.filter {
+            $0.activationPolicy == .regular && $0.processIdentifier != getpid()
+                && $0.bundleIdentifier != "com.apple.finder" && !$0.isTerminated
+        }
+        let names = apps.compactMap(\.localizedName)
+        shutdownProgress = RemoteShutdown(requestedAt: Int64(Date().timeIntervalSince1970), phase: .pending,
+            trigger: trigger, detail: names.isEmpty ? "macOS is shutting down."
+                : "Quitting \(names.prefix(6).joined(separator: ", "))\(names.count > 6 ? " and \(names.count - 6) more" : ""), then shutting down.")
+        setShutdownSchedule(nil)
+        historyRecorder.note("Shutting down (\(trigger))")
+        lastError = nil
+        // Tells Macs that mount this one to let go, like a sleep notice.
+        powerNotices.publish(sleeping: true, secret: companionConfigurationStore.secret)
+        refreshIcon()
+        completion(.success(()))
+
+        // Give the signed answer and the notices time to leave before apps quit.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+            guard let self, self.shutdownProgress?.phase == .pending else { return }
+            for app in apps { app.terminate() }
+            self.waitForAppsThenShutDown(apps, deadline: Date().addingTimeInterval(30))
+        }
+    }
+
+    private func waitForAppsThenShutDown(_ apps: [NSRunningApplication], deadline: Date) {
+        let running = apps.filter { !$0.isTerminated }
+        if !running.isEmpty, Date() < deadline {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+                self?.waitForAppsThenShutDown(running, deadline: deadline)
+            }
+            return
+        }
+        if !running.isEmpty {
+            historyRecorder.note("Still open at shutdown: \(running.compactMap(\.localizedName).joined(separator: ", "))")
+        }
+        helperClient.shutDownNow { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success:
+                self.historyRecorder.note("macOS is shutting down")
+                // Normally this app is gone long before; if not, say so instead of "pending".
+                let requestedAt = self.shutdownProgress?.requestedAt
+                DispatchQueue.main.asyncAfter(deadline: .now() + 180) { [weak self] in
+                    guard let self, let progress = self.shutdownProgress, progress.phase == .pending,
+                          progress.requestedAt == requestedAt else { return }
+                    self.failShutdown("macOS accepted the shutdown but is still running after 3 minutes.")
+                }
+            case .failure(let error):
+                self.failShutdown("The Mac did not shut down: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func failShutdown(_ detail: String) {
+        t3ShutdownGate.arm()
+        shutdownProgress = RemoteShutdown(requestedAt: shutdownProgress?.requestedAt
+            ?? Int64(Date().timeIntervalSince1970), phase: .failed,
+            trigger: shutdownProgress?.trigger ?? "", detail: detail)
+        lastError = detail
+        historyRecorder.note(detail)
+        powerNotices.publish(sleeping: hasSleepIntent, secret: companionConfigurationStore.secret)
+        refreshIcon()
+    }
+
+    private func scheduleShutdown(argument: String, source: String,
+                                  completion: @escaping (Result<(RemoteState, String), Error>) -> Void) {
+        guard let seconds = Int64(argument), ShutdownSchedule.allowedSeconds.contains(TimeInterval(seconds)) else {
+            completion(.failure(CompanionRemoteError("The shutdown timer must be between 1 minute and 24 hours.")))
+            return
+        }
+        refreshHelperStatus()
+        guard helperStatus == .enabled else {
+            completion(.failure(CompanionRemoteError(
+                "The privileged helper is not enabled. Open Modafinil on the Mac to approve it.")))
+            return
+        }
+        guard shutdownProgress?.phase != .pending else {
+            completion(.failure(CompanionRemoteError("The Mac is already shutting down.")))
+            return
+        }
+        let schedule: ShutdownSchedule
+        do {
+            schedule = try ShutdownSchedule(after: TimeInterval(seconds), now: Date(),
+                continuousNow: SystemSleepTimes.continuousTime, bootTime: try SystemSleepTimes.read().boot)
+        } catch {
+            completion(.failure(error))
+            return
+        }
+        // One power-down timer at a time: the shutdown timer replaces a sleep timer.
+        helperClient.setSleepTimer(after: 0) { [weak self] result in
+            guard let self else { return }
+            self.synchronizeSleepJournal()
+            if case .failure(let error) = result {
+                completion(.failure(error))
+                return
+            }
+            if self.shutdownProgress?.phase == .failed { self.shutdownProgress = nil }
+            self.setShutdownSchedule(schedule)
+            self.historyRecorder.note("Shutdown timer set for \(Self.durationText(Double(seconds))) (\(source))")
+            self.refreshIcon()
+            completion(.success((self.makeRemoteState(), "Shutdown timer saved on the Mac.")))
+        }
+    }
+
+    private static func loadShutdownSchedule() -> ShutdownSchedule? {
+        UserDefaults.standard.data(forKey: shutdownScheduleDefaultsKey)
+            .flatMap { try? JSONDecoder().decode(ShutdownSchedule.self, from: $0) }
+    }
+
+    private func setShutdownSchedule(_ schedule: ShutdownSchedule?) {
+        shutdownSchedule = schedule
+        if let schedule, let data = try? JSONEncoder().encode(schedule) {
+            UserDefaults.standard.set(data, forKey: Self.shutdownScheduleDefaultsKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: Self.shutdownScheduleDefaultsKey)
+        }
+        armShutdownTimer()
+    }
+
+    /// A timer saved before a restart or a power cut is dropped, never run.
+    private func restoreShutdownSchedule() {
+        checkShutdownTimer()
+        armShutdownTimer()
+    }
+
+    private func checkShutdownTimer() {
+        guard let schedule = shutdownSchedule, let boot = try? SystemSleepTimes.read().boot else { return }
+        switch schedule.status(now: Date(), continuousNow: SystemSleepTimes.continuousTime, bootTime: boot) {
+        case .waiting:
+            armShutdownTimer()
+        case .otherBoot:
+            setShutdownSchedule(nil)
+            historyRecorder.note("Shutdown timer dropped: the Mac restarted before it was due")
+        case .missed:
+            setShutdownSchedule(nil)
+            historyRecorder.note("Shutdown timer missed (the Mac was asleep at \(schedule.date.formatted(date: .omitted, time: .shortened))); it stays on")
+            lastError = "The shutdown timer was missed while the Mac was asleep. It stays on."
+        case .due:
+            beginShutdown(trigger: "timer") { [weak self] result in
+                if case .failure(let error) = result {
+                    self?.setShutdownSchedule(nil)
+                    self?.lastError = "The shutdown timer could not start: \(error.localizedDescription)"
+                    self?.historyRecorder.note("Shutdown timer failed: \(error.localizedDescription)")
+                }
+            }
+        }
+        refreshIcon()
+    }
+
+    private func armShutdownTimer() {
+        shutdownTimer?.invalidate()
+        shutdownTimer = nil
+        guard let schedule = shutdownSchedule else {
+            if let activity = shutdownTimerActivity {
+                ProcessInfo.processInfo.endActivity(activity)
+                shutdownTimerActivity = nil
+            }
+            return
+        }
+        // Keeps App Nap from delaying the timer; no power assertion, sleep stays allowed.
+        if shutdownTimerActivity == nil {
+            shutdownTimerActivity = ProcessInfo.processInfo.beginActivity(
+                options: .userInitiatedAllowingIdleSystemSleep, reason: "Waiting for the shutdown timer")
+        }
+        let remaining = schedule.continuousDeadline - SystemSleepTimes.continuousTime
+        let fire = min(schedule.date, Date().addingTimeInterval(max(0, remaining)))
+        let timer = Timer(fire: max(Date(), fire), interval: 0, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.shutdownTimer = nil
+                self?.checkShutdownTimer()
+            }
+        }
+        timer.tolerance = 1
+        shutdownTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func setT3PowerAction(_ action: RemotePowerAction, source: String) {
+        guard action != t3PowerAction else { return }
+        t3PowerAction = action
+        UserDefaults.standard.set(action.rawValue, forKey: Self.t3ActionDefaultsKey)
+        t3ShutdownGate.arm()
+        t3ShutdownHold = nil
+        historyRecorder.note("When T3 Code finishes: \(action == .shutdown ? "shut down" : "sleep") (\(source))")
+        refreshIcon()
+    }
+
+    private func keepAwakeJobs() -> [KeepAwakeJobs.Job] {
+        KeepAwakeJobs.find(assertions: SleepBlockers.readAssertions(),
+                           isRegularApp: { NSRunningApplication(processIdentifier: $0)?.activationPolicy == .regular })
+    }
+
     // MARK: Sleep when T3 Code threads finish
 
     @objc private func toggleT3Sleep() {
@@ -1542,6 +1833,8 @@ final class AppDelegate: NSObject,
         isT3SleepEnabled = enabled
         // Changing the setting starts the rule fresh.
         t3SleepWatch.clearWaitForNewActivity()
+        t3ShutdownGate.arm()
+        t3ShutdownHold = nil
         UserDefaults.standard.set(enabled, forKey: Self.t3SleepEnabledDefaultsKey)
         if !enabled { isKeepAwakeSuspendedForT3Sleep = false }
         historyRecorder.note("Sleep when T3 Code finishes \(enabled ? "on" : "off") (\(source))")
@@ -1603,8 +1896,10 @@ final class AppDelegate: NSObject,
            idle < 60, let wokeAt = lastRemoteKeepAwakeAt, Date().timeIntervalSince(wokeAt) > idle + 15 {
             t3SleepWatch.clearWaitForNewActivity()
         }
-        if conditions.isWatching, t3SleepWatch.waitsForNewActivity {
-            t3SleepWatch.noteRunStarted(at: t3ActivityReader.latestRunRequestedAt())
+        if conditions.isWatching, t3SleepWatch.waitsForNewActivity || !t3ShutdownGate.allowsShutdown {
+            let latestRun = t3ActivityReader.latestRunRequestedAt()
+            t3SleepWatch.noteRunStarted(at: latestRun)
+            t3ShutdownGate.noteLatestRun(requestedAt: latestRun)
         }
         let previousSleepAt = t3SleepAt
         switch t3SleepWatch.evaluate(conditions, now: Date(), activity: readT3Activity) {
@@ -1613,10 +1908,40 @@ final class AppDelegate: NSObject,
             endT3WatchActivity()
         case .busy:
             t3SleepAt = nil
+            t3ShutdownGate.noteBusy()
+            t3ShutdownHold = nil
             beginT3WatchActivity()
         case .waitingForGrace(let sleepAt):
             t3SleepAt = sleepAt
             beginT3WatchActivity()
+        case .sleepNow where t3PowerAction == .shutdown:
+            // Still finished after the grace period. Re-checked every 15 s until allowed.
+            t3SleepAt = nil
+            let previousHold = t3ShutdownHold
+            let jobs = keepAwakeJobs()
+            if !t3ShutdownGate.allowsShutdown {
+                t3ShutdownHold = nil
+            } else if !jobs.isEmpty {
+                t3ShutdownHold = "waiting for \(jobs.prefix(2).map(\.title).joined(separator: ", ")) to finish"
+                if previousHold != t3ShutdownHold {
+                    historyRecorder.note("Shutdown after T3 Code finished: \(t3ShutdownHold!)")
+                }
+            } else if shutdownProgress?.phase != .pending {
+                t3ShutdownHold = nil
+                t3SleepWatch.reset()
+                endT3WatchActivity()
+                beginShutdown(trigger: "T3 Code finished") { [weak self] result in
+                    guard let self, case .failure(let error) = result else { return }
+                    // Needs a new T3 run before trying again, so a failure cannot repeat every 15 s.
+                    self.t3ShutdownGate.arm()
+                    self.lastError = "Could not shut down after T3 Code finished: \(error.localizedDescription)"
+                    self.historyRecorder.note(self.lastError!)
+                    self.refreshIcon()
+                }
+                return
+            }
+            if previousHold != t3ShutdownHold { refreshUI() }
+            return
         case .sleepNow:
             t3SleepAt = nil
             t3SleepWatch.reset()
@@ -1944,7 +2269,7 @@ final class AppDelegate: NSObject,
         snapshot.isT3SleepEnabled = isT3SleepEnabled
         snapshot.hasBuiltInLid = LidMonitor.hasBuiltInLid
         if let activity = currentT3ActivityForDisplay() {
-            snapshot.t3Status = activity.summary
+            snapshot.t3Status = t3PowerAction == .shutdown ? t3StatusLine(activity) : activity.summary
             if case .busy(let threads) = activity {
                 snapshot.t3Threads = threads.map { T3ThreadRow(title: $0.title, isWaiting: $0.isWaiting, isInBackground: $0.isInBackground) }
             }
@@ -1964,7 +2289,11 @@ final class AppDelegate: NSObject,
         }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         snapshot.helperStatus = helperStatusDescription
         snapshot.isHelperEnabled = helperStatus == .enabled
-        snapshot.scheduledSleepDate = scheduledSleepDate
+        snapshot.scheduledSleepDate = shutdownSchedule?.date ?? scheduledSleepDate
+        snapshot.isShutdownScheduled = shutdownSchedule != nil
+        snapshot.shutdownProgress = shutdownProgress
+        snapshot.t3PowerAction = t3PowerAction
+        snapshot.keepAwakeJobs = keepAwakeJobs().map(\.title)
         snapshot.scheduledWakeDate = scheduledWakeDate
         snapshot.canScheduleSleep = helperStatus == .enabled && !isToggleInFlight && !isQuitInProgress
         snapshot.canScheduleWake = helperStatus == .enabled && !isWakeScheduleInFlight && !isQuitInProgress
@@ -2096,6 +2425,8 @@ final class AppDelegate: NSObject,
     private static let codexRuntimeLimitEnabledDefaultsKey = "CodexRuntimeLimitEnabled"
     private static let t3SleepEnabledDefaultsKey = "T3SleepWhenFinishedEnabled"
     private static let t3SleepRestoreDefaultsKey = "T3SleepRestoreKeepAwake"
+    private static let t3ActionDefaultsKey = "T3SleepWhenFinishedAction"
+    private static let shutdownScheduleDefaultsKey = "ShutdownSchedule"
     private static let quitBlockersDefaultsKey = "QuitSleepBlockersBeforeSleep"
     private static let quitBlockersExclusionsDefaultsKey = "QuitSleepBlockersExclusions"
 }
